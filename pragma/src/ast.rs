@@ -1,6 +1,8 @@
-use smol_str::SmolStr;
+use serde::Serialize;
+use crate::smol_str2::SmolStr2;
 use crate::span::Span;
 
+#[derive(Debug, Serialize)]
 pub struct Ast<T> {
     pub span: Span,
     pub node: T,
@@ -16,32 +18,69 @@ impl<T> NodeExt for T {
     }
 }
 
+#[derive(Debug, Serialize)]
 pub struct PunctComma;
+
+#[derive(Debug, Serialize)]
 pub struct PunctSemi;
+
+#[derive(Debug, Serialize)]
 pub struct PunctEq;
+
+#[derive(Debug, Serialize)]
 pub struct PunctColon;
+
+#[derive(Debug, Serialize)]
 pub struct PunctArrow;
+
+#[derive(Debug, Serialize)]
 pub struct PunctLBrace;
+
+#[derive(Debug, Serialize)]
 pub struct PunctRBrace;
+
+#[derive(Debug, Serialize)]
 pub struct PunctLParen;
+
+#[derive(Debug, Serialize)]
 pub struct PunctRParen;
+
+#[derive(Debug, Serialize)]
 pub struct PunctLBracket;
+
+#[derive(Debug, Serialize)]
 pub struct PunctRBracket;
+
+#[derive(Debug, Serialize)]
 pub struct KwStruct;
+
+#[derive(Debug, Serialize)]
 pub struct KwType;
+
+#[derive(Debug, Serialize)]
 pub struct KwFnTy;
+
+#[derive(Debug, Serialize)]
 pub struct KwFn;
+
+#[derive(Debug, Serialize)]
 pub struct KwIf;
+
+#[derive(Debug, Serialize)]
 pub struct KwWhile;
+
+#[derive(Debug, Serialize)]
 pub struct KwReturn;
 
 
+#[derive(Debug, Serialize)]
 pub struct Module {
     pub items: Vec<Ast<Item>>,
 }
 
+#[derive(Debug, Serialize)]
 pub struct Item {
-    pub ident: Ast<SmolStr>,
+    pub ident: Ast<SmolStr2>,
     pub params: Vec<(Ast<Param>, Option<Ast<PunctComma>>)>,
     pub arrow: Option<Ast<PunctArrow>>,
     pub ret_ty: Option<Ast<Expr>>,
@@ -50,18 +89,21 @@ pub struct Item {
     pub semi: Ast<PunctSemi>,
 }
 
+#[derive(Debug, Serialize)]
 pub struct Param {
-    pub ident: Option<Ast<SmolStr>>,
+    pub ident: Option<Ast<SmolStr2>>,
     pub colon: Ast<PunctColon>,
     pub ty: Ast<Expr>,
 }
 
+#[derive(Debug, Serialize)]
 pub enum BinaryOp {
     Add,
     Sub,
     Mul,
 }
 
+#[derive(Debug, Serialize)]
 pub enum UnaryOp {
     Neg,
     Pos,
@@ -69,29 +111,30 @@ pub enum UnaryOp {
     Deref,
 }
 
+#[derive(Debug, Serialize)]
 pub enum Expr {
-    Ident(SmolStr),
+    Ident(SmolStr2),
     Number(u128),
-    String(SmolStr),
+    String(SmolStr2),
     Bool(bool),
     Hole,
     Uninit,
     StructDecl {
         kw_struct: Ast<KwStruct>,
         lbrace: Ast<PunctLBrace>,
-        fields: Vec<(Ast<SmolStr>, Ast<PunctColon>, Ast<Expr>, Option<Ast<PunctComma>>)>,
+        fields: Vec<(Ast<SmolStr2>, Ast<PunctColon>, Ast<Expr>, Option<Ast<PunctComma>>)>,
         rbrace: Ast<PunctRBrace>,
     },
     StructInit {
         struct_: Box<Ast<Expr>>,
         lbrace: Ast<PunctLBrace>,
-        fields: Vec<(Ast<SmolStr>, Ast<PunctColon>, Ast<Expr>, Option<Ast<PunctComma>>)>,
+        fields: Vec<(Ast<SmolStr2>, Ast<PunctColon>, Ast<Expr>, Option<Ast<PunctComma>>)>,
         rbrace: Ast<PunctRBrace>,
     },
     FnDecl {
         kw_fn: Ast<KwFn>,
         lparen: Ast<PunctLParen>,
-        args: Vec<(Ast<SmolStr>, Ast<Expr>, Option<Ast<PunctComma>>)>,
+        args: Vec<(Ast<SmolStr2>, Ast<Expr>, Option<Ast<PunctComma>>)>,
         rparen: Ast<PunctRParen>,
         ret_ty: Option<(Ast<PunctColon>, Box<Ast<Expr>>)>,
         body: Box<Ast<Expr>>,
@@ -132,7 +175,7 @@ pub enum Expr {
         body: Box<Ast<Expr>>,
     },
     Decl {
-        ident: Ast<SmolStr>,
+        ident: Ast<SmolStr2>,
         colon: Ast<PunctColon>,
         ty: Option<Box<Ast<Expr>>>,
         eq: Ast<PunctEq>,

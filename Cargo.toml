@@ -1,10 +1,5 @@
-[package]
-name = "pragma2"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-logos = "0.14.0"
-paste = "1.0.14"
-smol_str = "0.2.2"
-bitflags = "2.5.0"
+[workspace]
+resolver = "2"
+members = [
+    "pragma", "pragma-wasm",
+]

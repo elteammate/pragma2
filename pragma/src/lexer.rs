@@ -1,6 +1,6 @@
 use std::iter::Peekable;
 use logos::{Logos, SpannedIter};
-use smol_str::SmolStr;
+use crate::smol_str2::SmolStr2;
 
 #[derive(logos::Logos, Debug, PartialEq)]
 #[logos(skip r"\s+|//[^\n]*\n")]
@@ -63,13 +63,13 @@ pub enum Token {
     Number(Option<u128>),
     #[regex(r#""(\\"|\\n|\\t|\\r|[^"\n])*""#, |lex| {
         let s = lex.slice();
-        SmolStr::from(&s[1..s.len()-1])
+        SmolStr2::from(&s[1..s.len()-1])
     })]
-    String(SmolStr),
+    String(SmolStr2),
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| {
-        SmolStr::from(lex.slice())
+        SmolStr2::from(lex.slice())
     })]
-    Ident(SmolStr),
+    Ident(SmolStr2),
 }
 
 pub type Lex<'s> = Peekable<SpannedIter<'s, Token>>;

@@ -1,9 +1,11 @@
 use bitflags::bitflags;
-use smol_str::SmolStr;
+use serde::Serialize;
 use crate::ast::*;
 use crate::lexer::{lex, Lex, Token};
+use crate::smol_str2::SmolStr2;
 use crate::span::Span;
 
+#[derive(Serialize, Debug)]
 pub enum ParseError {
     UnexpectedToken(Span),
     UnexpectedEof,
@@ -564,7 +566,7 @@ simple_parser!(parse_fn_ty, KwFnTy: Token::FnTy => KwFnTy, "Expected `Fn`");
 simple_parser!(parse_return_kw, KwReturn: Token::Return => KwReturn, "Expected `return`");
 simple_parser!(parse_if_kw, KwIf: Token::If => KwIf, "Expected `if`");
 simple_parser!(parse_while_kw, KwWhile: Token::While => KwWhile, "Expected `while`");
-simple_parser!(parse_ident, SmolStr: Token::Ident(s) => s, "Expected identifier");
+simple_parser!(parse_ident, SmolStr2: Token::Ident(s) => s, "Expected identifier");
 
 fn maybe_parse_comma(lex: &mut Lex) -> Result<Option<Ast<PunctComma>>> {
     Ok(if let Some((Ok(Token::Comma), _)) = lex.peek() {

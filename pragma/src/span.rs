@@ -1,6 +1,7 @@
 use std::ops::Range;
+use serde::Serialize;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Serialize)]
 pub struct Span(pub u32, pub u32);
 
 impl Span {
