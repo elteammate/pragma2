@@ -3,7 +3,7 @@
 import {ReactNode, useEffect, useMemo, useRef, useState} from "react"
 import ReactCodeMirror, {
   Decoration,
-  EditorView, Extension,
+  EditorView,
   hoverTooltip, ReactCodeMirrorRef, StateEffect, StateField,
 } from "@uiw/react-codemirror"
 import {json} from "@codemirror/lang-json"
@@ -52,19 +52,32 @@ const messagesField: StateField<Message[]> = StateField.define({
 const errorHover = hoverTooltip((view, pos) => {
   const errors: ReactNode[] = []
 
-  const messages = view.state.field(messagesField)
+  const messages = view.state.field(messagesField, false) ?? []
 
   for (let i = 0; i < messages.length; i++){
     const m = messages[i]
-    if (m.from <= pos && pos < m.to && pos < view.state.doc.length) {
-      console.log(m.message)
-      errors.push(<div className="p-2" key={i}>{m.message}</div>)
+    if (m.from <= pos && pos < m.to) {
+      let text = m.message
+      let chunks = text.split("`")
+      let parts: ReactNode[] = []
+      for (let i = 0; i < chunks.length; i++) {
+        if (i % 2 == 0) {
+          parts.push(<p key={i}>{chunks[i]}</p>)
+        } else {
+          parts.push(<pre key={i} className="text-amber-200">{chunks[i]}</pre>)
+        }
+      }
+      errors.push(<div className="p-2 m-1 rounded-md bg-gray-700">{parts}</div>)
     }
   }
 
   const element = document.createElement("div")
   const root = createRoot(element)
-  root.render(<div className="w-96">{errors}</div>)
+  if (errors.length != 0) {
+    root.render(<div className="w-[500px] p-2 rounded-md overflow-y-auto max-h-96 text-xs">
+      {errors}
+    </div>)
+  }
 
   return {
     pos: pos - 1,
@@ -74,6 +87,9 @@ const errorHover = hoverTooltip((view, pos) => {
       return {dom: element}
     }
   }
+}, {
+  hoverTime: 1,
+  hideOnChange: true,
 })
 
 export default function Home() {
@@ -150,7 +166,7 @@ export default function Home() {
         } else if (err.UnexpectedEof) {
           const msg = err.UnexpectedEof
           messages.push({
-            from: code.length - 2,
+            from: code.length - 1,
             to: code.length,
             message: msg,
           })
@@ -173,6 +189,7 @@ export default function Home() {
     const view = refs.current.view
 
     let effects: StateEffect<any>[] = messages
+      .filter((m) => m.from !== m.to)
       .map((m) => addError.of(m))
 
     if (!effects.length) return

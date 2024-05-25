@@ -31,7 +31,7 @@ pub fn compile(input: &str) -> Result<Output, CompileError> {
     let mut buffer = Vec::<u8>::new();
     
     for (ident, (item, ty)) in ctx.iter() {
-        writeln!(buffer, "{} = {} \n    : {}\n", &ident[..], item, ty).unwrap();
+        writeln!(buffer, "{} = {:4} \n      : {:8}\n", &ident[..], item, ty).unwrap();
     }
     
     Ok(Output {
@@ -43,8 +43,9 @@ pub fn compile(input: &str) -> Result<Output, CompileError> {
 #[test]
 fn test() {
     let input = r#"
-x [5] = 0;
-a = x[5];
+plus_out T:type, Q:type -> type;
+plus_out [int], [int] = int;
+plus T:type, Q:type, a:T, b:T -> plus_out[T, Q];
     "#;
     let output = compile(input);
     println!("{:#?}", output);
