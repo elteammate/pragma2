@@ -4,112 +4,25 @@ use crate::ast::*;
 use crate::lexer::{lex, Lex, Token};
 use crate::smol_str2::SmolStr2;
 use crate::span::Span;
+use crate::compound_result::{CompoundResult, ResultExt};
+use crate::{vmrg, cmrg};
 
 #[derive(Serialize, Debug)]
 pub enum ParseError {
     UnexpectedToken(Span),
-    UnexpectedEof,
-    Verbatim(Span, String),
+    UnexpectedEof(String),
+    Spanned(Span, String),
 }
 
-type Result<T> = std::result::Result<T, Vec<ParseError>>;
+type Result<T> = CompoundResult<T, ParseError>;
 
+trait ParseResultExt<T> {
+    fn recover(self, lex: &mut Lex, target: RecoveryTarget) -> Result<T>;
 
-macro_rules! xbail {
-    (@ $(,)?) => {
-        Result::Ok(())
-    };
-    (@ $x:expr, $($rest:expr),* $(,)?) => {
-        match ($x, xbail!(@ $($rest,)*)) {
-            (Ok(x), Ok(rest)) => Ok((x, rest)),
-            (Err(e), Ok(_)) => {
-                Err(e)
-            }
-            (Ok(_), Err(e)) => {
-                Err(e)
-            }
-            (Err(mut e), Err(mut e2)) => {
-                e.append(&mut e2);
-                Err(e)
-            }
-        }
-    };
-    ($x:expr) => {
-        match xbail!(@ $x) {
-            Ok((x, ())) => Ok(x),
-            Err(e) => Err(e),
-        }
-
-    };
-    ($x1:expr, $x2:expr) => {
-        match xbail!(@ $x1, $x2) {
-            Ok((x1, (x2, ()))) => Ok((x1, x2)),
-            Err(e) => Err(e),
-        }
-    };
-    ($x1:expr, $x2:expr, $x3:expr) => {
-        match xbail!(@ $x1, $x2, $x3) {
-            Ok((x1, (x2, (x3, ())))) => Ok((x1, x2, x3)),
-            Err(e) => Err(e),
-        }
-    };
-    ($x1:expr, $x2:expr, $x3:expr, $x4:expr) => {
-        match xbail!(@ $x1, $x2, $x3, $x4) {
-            Ok((x1, (x2, (x3, (x4, ()))))) => Ok((x1, x2, x3, x4)),
-            Err(e) => Err(e),
-        }
-    };
-    ($x1:expr, $x2:expr, $x3:expr, $x4:expr, $x5:expr) => {
-        match xbail!(@ $x1, $x2, $x3, $x4, $x5) {
-            Ok((x1, (x2, (x3, (x4, (x5, ())))))) => Ok((x1, x2, x3, x4, x5)),
-            Err(e) => Err(e),
-        }
-    };
-    ($x1:expr, $x2:expr, $x3:expr, $x4:expr, $x5:expr, $x6:expr) => {
-        match xbail!(@ $x1, $x2, $x3, $x4, $x5, $x6) {
-            Ok((x1, (x2, (x3, (x4, (x5, (x6, ()))))))) => Ok((x1, x2, x3, x4, x5, x6)),
-            Err(e) => Err(e),
-        }
-    };
-    ($x1:expr, $x2:expr, $x3:expr, $x4:expr, $x5:expr, $x6:expr, $x7:expr) => {
-        match xbail!(@ $x1, $x2, $x3, $x4, $x5, $x6, $x7) {
-            Ok((x1, (x2, (x3, (x4, (x5, (x6, (x7, ())))))))) => Ok((x1, x2, x3, x4, x5, x6, x7)),
-            Err(e) => Err(e),
-        }
-    };
-    ($x1:expr, $x2:expr, $x3:expr, $x4:expr, $x5:expr, $x6:expr, $x7:expr, $x8:expr) => {
-        match xbail!(@ $x1, $x2, $x3, $x4, $x5, $x6, $x7, $x8) {
-            Ok((x1, (x2, (x3, (x4, (x5, (x6, (x7, (x8, ()))))))))) => Ok((x1, x2, x3, x4, x5, x6, x7, x8)),
-            Err(e) => Err(e),
-        }
-    };
 }
 
-macro_rules! vecbail {
-    ($x:expr) => {{
-        let mut errors = Vec::new();
-        let mut results = Vec::with_capacity($x.len());
-        for x in $x {
-            match x {
-                Ok(x) => results.push(x),
-                Err(mut e) => errors.append(&mut e),
-            }
-        }
-        if errors.is_empty() {
-            Ok(results)
-        } else {
-            Err(errors)
-        }
-    }};
-}
-
-trait ResultExt<T> {
-    fn recover(self, lex: &mut Lex, target: RecoveryTarget) -> Self;
-    fn delegate<Q>(self, other: &mut Result<Q>) -> Option<T>;
-}
-
-impl<T> ResultExt<T> for Result<T> {
-    fn recover(self, lex: &mut Lex, target: RecoveryTarget) -> Self {
+impl<T> ParseResultExt<T> for Result<T> {
+    fn recover(self, lex: &mut Lex, target: RecoveryTarget) -> Result<T> {
         match self {
             Ok(x) => Ok(x),
             Err(mut errors) => {
@@ -120,21 +33,6 @@ impl<T> ResultExt<T> for Result<T> {
                         Err(errors)
                     }
                 }
-            }
-        }
-    }
-
-    fn delegate<Q>(self, other: &mut Result<Q>) -> Option<T> {
-        match self {
-            Ok(x) => Some(x),
-            Err(mut e) => {
-                match other {
-                    Ok(_) => *other = Err(e),
-                    Err(e2) => {
-                        e2.append(&mut e);
-                    }
-                }
-                None
             }
         }
     }
@@ -156,7 +54,7 @@ impl<T> OkAndSome for Result<Option<T>> {
     }
 
     fn err_or_none(&self) -> bool {
-        matches!(self, Err(_))
+        self.is_err() || self.ok_and_none()
     }
 }
 
@@ -169,7 +67,7 @@ pub fn parse(input: &str) -> Result<Module> {
         items.push(parse_item(&mut lex))
     }
 
-    let items = vecbail!(items)?;
+    let items = vmrg!(items)?;
     Ok(Module { items })
 }
 
@@ -179,23 +77,28 @@ fn parse_item(lex: &mut Lex) -> Result<Ast<Item>> {
     let mut params = Vec::new();
     while let Some((t, span)) = lex.peek() {
         match t {
-            Ok(Token::Colon | Token::Ident(_)) => {
-                let param = parse_item_param(lex).recover(lex, RecoveryTarget::Comma);
+            Ok(Token::Colon | Token::Ident(_) | Token::LBracket) => {
+                let param = parse_item_param(lex)
+                    .recover(lex, RecoveryTarget::Eq | RecoveryTarget::Semi | RecoveryTarget::Arrow);
                 let comma = maybe_parse_comma(lex);
                 let stop = comma.ok_and_none();
-                params.push(xbail!(param, comma));
+                params.push(cmrg!(param, comma));
                 if stop { break }
             }
             Ok(Token::Arrow | Token::Eq) => break,
-            Ok(_) => params.push(Err(vec![ParseError::Verbatim(
-                span.into(),
-               "Expected `:`, identifier, or continuation of the declaration".to_string()
-            )])),
+            Ok(_) => {
+                let span = span.into();
+                lex.next();
+                params.push(Err(vec![ParseError::Spanned(
+                    span,
+                    "Expected `:`, identifier, or continuation of the declaration".to_string()
+                )]))
+            },
             Err(_) => params.push(Err(vec![ParseError::UnexpectedToken(span.into())])),
         }
     }
 
-    let params = vecbail!(params).recover(lex, RecoveryTarget::Arrow);
+    let params = vmrg!(params).recover(lex, RecoveryTarget::Arrow);
 
     let (arrow, ret_ty) = if matches!(lex.peek(), Some((Ok(Token::Arrow), _))) {
         let arrow = parse_arrow(lex).recover(lex, RecoveryTarget::Semi | RecoveryTarget::Eq);
@@ -216,14 +119,14 @@ fn parse_item(lex: &mut Lex) -> Result<Ast<Item>> {
     let semi = parse_semi(lex);
 
     if let (Ok(i), Ok(None), Ok(None)) = (&mut ident, &ret_ty, &body) {
-        Result::<()>::Err(vec![ParseError::Verbatim(
+        Result::<()>::Err(vec![ParseError::Spanned(
             i.span,
             "Expected a return type or a body".to_string()
         )]).delegate(&mut ident);
     }
 
     let (ident, params, arrow, ret_ty, eq, body, semi) =
-        xbail!(ident, params, arrow, ret_ty, eq, body, semi)?;
+        cmrg!(ident, params, arrow, ret_ty, eq, body, semi)?;
 
     let span = ident.span.merge(semi.span);
     Ok(Item {
@@ -241,10 +144,11 @@ fn parse_item_param(lex: &mut Lex) -> Result<Ast<Param>> {
     match lex.peek() {
         Some((Ok(Token::Colon), _)) => {
             let colon = parse_colon(lex);
-            let ty = parse_expr(lex, ParseUntil::Termination);
-            let (colon, ty) = xbail!(colon, ty).recover(lex, RecoveryTarget::Comma)?;
+            let ty = parse_expr(lex, ParseUntil::Eq | ParseUntil::Arrow);
+            let (colon, ty) = cmrg!(colon, ty)
+                .recover(lex, RecoveryTarget::Comma | RecoveryTarget::Eq | RecoveryTarget::Arrow | RecoveryTarget::Semi)?;
             let span = colon.span.merge(ty.span);
-            Ok(Param {
+            Ok(Param::Generic {
                 ident: None,
                 colon,
                 ty,
@@ -253,30 +157,166 @@ fn parse_item_param(lex: &mut Lex) -> Result<Ast<Param>> {
         Some((Ok(Token::Ident(_)), _)) => {
             let ident = parse_ident(lex);
             let colon = parse_colon(lex);
-            let ty = parse_expr(lex, ParseUntil::Termination);
-            let (ident, colon, ty) = xbail!(ident, colon, ty).recover(lex, RecoveryTarget::Comma)?;
+            let ty = parse_expr(lex, ParseUntil::Eq | ParseUntil::Arrow);
+            let (ident, colon, ty) = cmrg!(ident, colon, ty).recover(lex, RecoveryTarget::Comma)?;
             let span = ident.span.merge(ty.span);
-            Ok(Param {
+            Ok(Param::Generic {
                 ident: Some(ident),
                 colon,
                 ty,
             }.spanned(span))
         }
-        Some((Ok(_), span)) => Err(vec![ParseError::Verbatim(span.into(), "Expected identifier or comma".to_string())]),
-        Some((Err(_), span)) => Err(vec![ParseError::UnexpectedToken(span.into())]),
-        None => Err(vec![ParseError::UnexpectedEof]),
+        Some((Ok(Token::LBracket), _)) => {
+            let lbracket = parse_lbracket(lex);
+            let value = parse_expr(lex, ParseUntil::Eq | ParseUntil::Arrow)
+                .recover(lex, RecoveryTarget::Comma | RecoveryTarget::Eq | RecoveryTarget::Arrow | RecoveryTarget::Semi | RecoveryTarget::RBracket);
+            let rbracket = parse_rbracket(lex);
+            let (lbracket, value, rbracket) = cmrg!(lbracket, value, rbracket)?;
+            let span = lbracket.span.merge(rbracket.span);
+            Ok(Param::Value {
+                lbracket,
+                value,
+                rbracket
+            }.spanned(span))
+        }
+        Some((Ok(_), span)) => 
+            Err(vec![ParseError::Spanned(span.into(), "Expected identifier or comma".to_string())]),
+        Some((Err(_), span)) => 
+            Err(vec![ParseError::UnexpectedToken(span.into())]),
+        None => 
+            Err(vec![ParseError::UnexpectedEof("Expected a parameter declaration".to_string())]),
     }
 }
 
-enum ParseUntil {
-    Termination,
-    Eq,
-    Colon,
-    Arrow,
+bitflags! {
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    struct ParseUntil : u32 {
+        const Termination = !0;
+        const Eq = 1 << 0;
+        const Arrow = 1 << 1;
+        const Colon = 1 << 2;
+    }
+}
+
+#[derive(Ord, PartialOrd, Eq, PartialEq)]
+enum Precedence {
+    Lowest,
+    Assign,
+    AddSub,
+    MulDiv,
+    Unary,
 }
 
 fn parse_expr(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
-    todo!()
+    let end = RecoveryTarget::Semi | RecoveryTarget::RBrace | RecoveryTarget::RParen;
+    parse_expr_impl(lex, until)
+        .recover(
+            lex,
+            end |
+                if until.contains(ParseUntil::Eq) { RecoveryTarget::Eq } else { RecoveryTarget::empty() } |
+                if until.contains(ParseUntil::Arrow) { RecoveryTarget::Arrow } else { RecoveryTarget::empty() } |
+                if until.contains(ParseUntil::Colon) { RecoveryTarget::Colon } else { RecoveryTarget::empty() }
+        )
+}
+
+fn parse_expr_impl(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
+    let lhs = parse_primary(lex, until)?;
+    
+    if matches!(until, ParseUntil::Termination) {
+        match lex.peek() {
+            Some((Ok(Token::Colon), _)) => {
+                let ident = extract_pattern(lhs);
+                let colon = parse_colon(lex);
+                let ty = if let Some((Ok(Token::Eq), _)) = lex.peek() {
+                    Some(parse_expr(lex, ParseUntil::Eq)).transpose()
+                } else {
+                    Ok(None)
+                };
+                let eq = parse_eq(lex);
+                let rhs = parse_expr(lex, ParseUntil::Termination);
+                let (ident, colon, ty, eq, rhs) = cmrg!(ident, colon, ty, eq, rhs)
+                    .recover(lex, RecoveryTarget::Semi)?;
+                let span = ident.span.merge(rhs.span);
+                return Ok(Expr::Decl {
+                    ident,
+                    colon,
+                    ty: ty.map(Box::new),
+                    eq,
+                    val: Box::new(rhs),
+                }.spanned(span));
+            }
+            Some((Ok(Token::Eq), _)) => {
+                let eq = parse_eq(lex);
+                let rhs = parse_expr(lex, ParseUntil::Termination);
+                let (eq, rhs) = cmrg!(eq, rhs).recover(lex, RecoveryTarget::Semi)?;
+                let span = lhs.span.merge(rhs.span);
+                return Ok(Expr::Assign {
+                    lvalue: Box::new(lhs),
+                    eq,
+                    value: Box::new(rhs),
+                }.spanned(span));
+            }
+            _ => {}
+        }
+    }
+
+    let mut stack = vec![(lhs, Precedence::Lowest, None)];
+
+    loop {
+        let op = match lex.peek() {
+            Some((Ok(Token::Plus), span)) => BinaryOp::Add.spanned(span.into()),
+            Some((Ok(Token::Minus), span)) => BinaryOp::Sub.spanned(span.into()),
+            Some((Ok(Token::Star), span)) => BinaryOp::Mul.spanned(span.into()),
+            _ => break,
+        };
+        lex.next();
+        let prec = match op.node {
+            BinaryOp::Add | BinaryOp::Sub => Precedence::AddSub,
+            BinaryOp::Mul => Precedence::MulDiv,
+        };
+
+        let mut operand = parse_primary(lex, until)?;
+
+        let mut op = Some(op);
+        while let Some((_, prec2, _)) = stack.last() {
+            if *prec2 < prec {
+                break;
+            }
+
+            let (rhs, _, op2) = stack.pop().unwrap();
+            let (lhs, p, prev_op) = stack.pop().unwrap();
+            let span = lhs.span.merge(rhs.span);
+            stack.push((
+                Expr::Binary {
+                    op: op2.unwrap(),
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                }.spanned(span),
+                p,
+                prev_op,
+            ));
+        }
+
+        stack.push((operand, prec, op));
+    }
+
+    while let Some((rhs, _, op)) = stack.pop() {
+        let Some((lhs, _, prev_op)) = stack.pop() else {
+            return Ok(rhs);
+        };
+        let span = lhs.span.merge(rhs.span);
+        stack.push((
+            Expr::Binary {
+                op: op.unwrap(),
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            }.spanned(span),
+            Precedence::Lowest,
+            prev_op,
+        ));
+    }
+
+    unreachable!()
 }
 
 fn parse_primary(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
@@ -287,35 +327,54 @@ fn parse_primary(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
             Expr::Ident(ident.node).spanned(span)
         }
         Some((Ok(Token::Number(n)), span)) => {
-            let n = n.ok_or(vec![ParseError::Verbatim(span.into(), "Couldn't parse number".to_string())])?;
-            Expr::Number(n).spanned(span.into())
+            let n = n.ok_or(vec![ParseError::Spanned(span.into(), "Couldn't parse number".to_string())])?;
+            let result = Expr::Int(n).spanned(span.into());
+            lex.next();
+            result
         }
         Some((Ok(Token::String(s)), span)) => {
-            Expr::String(s.clone()).spanned(span.into())
+            let result = Expr::String(s.clone()).spanned(span.into());
+            lex.next();
+            result
         }
         Some((Ok(Token::True), span)) => {
-            Expr::Bool(true).spanned(span.into())
+            let result = Expr::Bool(true).spanned(span.into());
+            lex.next();
+            result
         }
         Some((Ok(Token::False), span)) => {
-            Expr::Bool(false).spanned(span.into())
+            let result = Expr::Bool(false).spanned(span.into());
+            lex.next();
+            result
         }
         Some((Ok(Token::Hole), span)) => {
-            Expr::Hole.spanned(span.into())
+            let result = Expr::Hole.spanned(span.into());
+            lex.next();
+            result
         }
         Some((Ok(Token::Uninit), span)) => {
-            Expr::Uninit.spanned(span.into())
+            let result = Expr::Uninit.spanned(span.into());
+            lex.next();
+            result
         }
         Some((Ok(Token::LParen), _)) => {
             let lparen = parse_lparen(lex);
-            let expr = parse_expr(lex, ParseUntil::Termination).recover(lex, RecoveryTarget::RParen);
-            let rparen = parse_rparen(lex);
-            let (lparen, expr, rparen) = xbail!(lparen, expr, rparen)?;
-            let span = lparen.span.merge(rparen.span);
-            Expr::Paren {
-                lparen,
-                expr: Box::new(expr),
-                rparen,
-            }.spanned(span)
+            if matches!(lex.peek(), Some((Ok(Token::RParen), _)) | None) {
+                let rparen = parse_rparen(lex);
+                let (lparen, rparen) = cmrg!(lparen, rparen)?;
+                let span = lparen.span.merge(rparen.span);
+                Expr::Unit.spanned(span)
+            } else {
+                let expr = parse_expr(lex, ParseUntil::Termination).recover(lex, RecoveryTarget::RParen);
+                let rparen = parse_rparen(lex);
+                let (lparen, expr, rparen) = cmrg!(lparen, expr, rparen)?;
+                let span = lparen.span.merge(rparen.span);
+                Expr::Paren {
+                    lparen,
+                    expr: Box::new(expr),
+                    rparen,
+                }.spanned(span)
+            }
         }
         Some((Ok(tok@(Token::Plus | Token::Minus | Token::Star | Token::Ampersand)), span)) => {
             let span = span.into();
@@ -344,9 +403,9 @@ fn parse_primary(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
         Some((Ok(Token::While), _)) => parse_while(lex, until)?,
         Some((Ok(Token::Return), _)) => parse_return(lex, until)?,
 
-        Some((Ok(_), span)) => return Err(vec![ParseError::Verbatim(span.into(), "Expected expression".to_string())]),
+        Some((Ok(_), span)) => return Err(vec![ParseError::Spanned(span.into(), "Expected expression".to_string())]),
         Some((Err(_), span)) => return Err(vec![ParseError::UnexpectedToken(span.into())]),
-        None => return Err(vec![ParseError::UnexpectedEof]),
+        None => return Err(vec![ParseError::UnexpectedEof("Expected expression".to_string())]),
     };
 
     loop {
@@ -383,15 +442,15 @@ fn parse_primary(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
                     let value = parse_expr(lex, ParseUntil::Termination);
                     let comma = maybe_parse_comma(lex);
                     stop = comma.ok_and_none();
-                    let field = xbail!(ident, colon, value, comma)
+                    let field = cmrg!(ident, colon, value, comma)
                         .recover(lex, RecoveryTarget::Comma | RecoveryTarget::RBrace | RecoveryTarget::Semi);
 
                     fields.push(field);
                 }
 
-                let fields = vecbail!(fields).recover(lex, RecoveryTarget::RBrace);
+                let fields = vmrg!(fields).recover(lex, RecoveryTarget::RBrace);
                 let rbrace = parse_rbrace(lex);
-                let (lbrace, fields, rbrace) = xbail!(lbrace, fields, rbrace)
+                let (lbrace, fields, rbrace) = cmrg!(lbrace, fields, rbrace)
                     .recover(lex, RecoveryTarget::Semi | RecoveryTarget::RBrace)?;
 
                 let span = expr.span.merge(rbrace.span);
@@ -408,6 +467,13 @@ fn parse_primary(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
     }
 }
 
+fn extract_pattern(expr: Ast<Expr>) -> Result<Ast<SmolStr2>> {
+    match expr.node {
+        Expr::Ident(ident) => Ok(ident.spanned(expr.span)),
+        _ => Err(vec![ParseError::Spanned(expr.span, "Expected identifier, not expression".to_string())]),
+    }
+}
+
 fn parse_block(lex: &mut Lex) -> Result<Ast<Expr>> {
     let lbrace = parse_lbrace(lex);
     let mut stmts = Vec::new();
@@ -417,12 +483,12 @@ fn parse_block(lex: &mut Lex) -> Result<Ast<Expr>> {
             .recover(lex, RecoveryTarget::Semi | RecoveryTarget::RBrace);
         let semi = maybe_parse_semi(lex);
         stop = semi.ok_and_none();
-        stmts.push(xbail!(stmt, semi));
+        stmts.push(cmrg!(stmt, semi));
         if stop { break }
     }
-    let stmts = vecbail!(stmts).recover(lex, RecoveryTarget::RBrace);
+    let stmts = vmrg!(stmts).recover(lex, RecoveryTarget::RBrace);
     let rbrace = parse_rbrace(lex);
-    let (lbrace, mut stmts, rbrace) = xbail!(lbrace, stmts, rbrace)?;
+    let (lbrace, mut stmts, rbrace) = cmrg!(lbrace, stmts, rbrace)?;
     let ret = if !stop {
         stmts.pop().map(|(s, c)| {
             assert!(c.is_none());
@@ -455,15 +521,15 @@ fn parse_struct_decl(lex: &mut Lex) -> Result<Ast<Expr>> {
         let value = parse_expr(lex, ParseUntil::Termination);
         let comma = maybe_parse_comma(lex);
         stop = comma.ok_and_none();
-        let field = xbail!(ident, colon, value, comma)
+        let field = cmrg!(ident, colon, value, comma)
             .recover(lex, RecoveryTarget::Comma | RecoveryTarget::RBrace | RecoveryTarget::Semi);
 
         fields.push(field);
     }
 
-    let fields = vecbail!(fields).recover(lex, RecoveryTarget::RBrace);
+    let fields = vmrg!(fields).recover(lex, RecoveryTarget::RBrace);
     let rbrace = parse_rbrace(lex);
-    let (kw_struct, lbrace, fields, rbrace) = xbail!(kw_struct, lbrace, fields, rbrace)
+    let (kw_struct, lbrace, fields, rbrace) = cmrg!(kw_struct, lbrace, fields, rbrace)
         .recover(lex, RecoveryTarget::Semi | RecoveryTarget::RBrace)?;
 
     let span = kw_struct.span.merge(rbrace.span);
@@ -484,7 +550,22 @@ fn parse_fn_type(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
 }
 
 fn parse_type(lex: &mut Lex) -> Result<Ast<Expr>> {
-    todo!()
+    let kw_type = parse_type_kw(lex)?;
+    if let Some((Ok(Token::LBracket), _)) = lex.peek() {
+        let (lbracket, indicators, rbracket) = parse_params(lex)?;
+        let span = kw_type.span.merge(rbracket.span);
+        Ok(Expr::Type {
+            kw_type,
+            lbracket,
+            indicators,
+            rbracket,
+        }.spanned(span))
+    } else {
+        let span = kw_type.span;
+        Ok(Expr::PlainType {
+            kw_type,
+        }.spanned(span))
+    }
 }
 
 fn parse_if(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
@@ -508,12 +589,12 @@ fn parse_args(lex: &mut Lex) -> Result<(Ast<PunctLParen>, Vec<(Ast<Expr>, Option
             .recover(lex, RecoveryTarget::Comma | RecoveryTarget::RParen);
         let comma = maybe_parse_comma(lex);
         stop = comma.ok_and_none();
-        args.push(xbail!(arg, comma));
+        args.push(cmrg!(arg, comma));
         if stop { break }
     }
-    let args = vecbail!(args).recover(lex, RecoveryTarget::RParen);
+    let args = vmrg!(args).recover(lex, RecoveryTarget::RParen);
     let rparen = parse_rparen(lex);
-    let (lparen, args, rparen) = xbail!(lparen, args, rparen)?;
+    let (lparen, args, rparen) = cmrg!(lparen, args, rparen)?;
     Ok((lparen, args, rparen))
 }
 
@@ -526,12 +607,12 @@ fn parse_params(lex: &mut Lex) -> Result<(Ast<PunctLBracket>, Vec<(Ast<Expr>, Op
             .recover(lex, RecoveryTarget::Comma | RecoveryTarget::RBracket);
         let comma = maybe_parse_comma(lex);
         stop = comma.ok_and_none();
-        args.push(xbail!(arg, comma));
+        args.push(cmrg!(arg, comma));
         if stop { break }
     }
-    let args = vecbail!(args).recover(lex, RecoveryTarget::RBracket);
+    let args = vmrg!(args).recover(lex, RecoveryTarget::RBracket);
     let rbracket = parse_rbracket(lex);
-    let (lbracket, args, rbracket) = xbail!(lbracket, args, rbracket)?;
+    let (lbracket, args, rbracket) = cmrg!(lbracket, args, rbracket)?;
     Ok((lbracket, args, rbracket))
 }
 
@@ -540,9 +621,9 @@ macro_rules! simple_parser {
         fn $name(lex: &mut Lex) -> Result<Ast<$ty>> {
             match lex.next() {
                 Some((Ok($p), span)) => Ok(Ast { span: span.into(), node: $e }),
-                Some((Ok(_), span)) => Err(vec![ParseError::Verbatim(span.into(), $err.into())]),
+                Some((Ok(_), span)) => Err(vec![ParseError::Spanned(span.into(), $err.into())]),
                 Some((Err(_), span)) => Err(vec![ParseError::UnexpectedToken(span.into())]),
-                None => Err(vec![ParseError::UnexpectedEof]),
+                None => Err(vec![ParseError::UnexpectedEof($err.into())]),
             }
         }
     };
@@ -598,10 +679,10 @@ bitflags! {
 }
 
 fn try_recover(lex: &mut Lex, target: RecoveryTarget) -> Result<()> {
-    enum Paren {
-        LParen(Span),
-        LBracket(Span),
-        LBrace(Span),
+    enum ParenKind {
+        Paren(Span),
+        Bracket(Span),
+        Brace(Span),
     }
 
     let mut paren_stack = Vec::new();
@@ -617,32 +698,32 @@ fn try_recover(lex: &mut Lex, target: RecoveryTarget) -> Result<()> {
             (Ok(Token::Arrow), 0) if target.intersects(RecoveryTarget::Arrow) => true,
             (Ok(Token::Eq), 0) if target.intersects(RecoveryTarget::Eq) => true,
             (Ok(Token::LParen), _) => {
-                paren_stack.push(Paren::LParen(span.into()));
+                paren_stack.push(ParenKind::Paren(span.into()));
                 false
             }
             (Ok(Token::LBracket), _) => {
-                paren_stack.push(Paren::LBracket(span.into()));
+                paren_stack.push(ParenKind::Bracket(span.into()));
                 false
             }
             (Ok(Token::LBrace), _) => {
-                paren_stack.push(Paren::LBrace(span.into()));
+                paren_stack.push(ParenKind::Brace(span.into()));
                 false
             }
             (Ok(Token::RParen), _) => {
-                if let Some(Paren::LParen(start)) = paren_stack.pop() {
-                    errors.push(ParseError::Verbatim(start, "Unmatched `(`".into()));
+                if let Some(ParenKind::Paren(start)) = paren_stack.pop() {
+                    errors.push(ParseError::Spanned(start, "Unmatched `(`".into()));
                 }
                 false
             }
             (Ok(Token::RBracket), _) => {
-                if let Some(Paren::LBracket(start)) = paren_stack.pop() {
-                    errors.push(ParseError::Verbatim(start, "Unmatched `[`".into()));
+                if let Some(ParenKind::Bracket(start)) = paren_stack.pop() {
+                    errors.push(ParseError::Spanned(start, "Unmatched `[`".into()));
                 }
                 false
             }
             (Ok(Token::RBrace), _) => {
-                if let Some(Paren::LBrace(start)) = paren_stack.pop() {
-                    errors.push(ParseError::Verbatim(start, "Unmatched `{`".into()));
+                if let Some(ParenKind::Brace(start)) = paren_stack.pop() {
+                    errors.push(ParseError::Spanned(start, "Unmatched `{`".into()));
                 }
                 false
             }
@@ -663,5 +744,5 @@ fn try_recover(lex: &mut Lex, target: RecoveryTarget) -> Result<()> {
         }
     }
 
-    Err(vec![ParseError::UnexpectedEof])
+    Err(vec![ParseError::UnexpectedEof("Unexpected EOF".into())])
 }

@@ -90,20 +90,27 @@ pub struct Item {
 }
 
 #[derive(Debug, Serialize)]
-pub struct Param {
-    pub ident: Option<Ast<SmolStr2>>,
-    pub colon: Ast<PunctColon>,
-    pub ty: Ast<Expr>,
+pub enum Param {
+    Generic {
+        ident: Option<Ast<SmolStr2>>,
+        colon: Ast<PunctColon>,
+        ty: Ast<Expr>,
+    },
+    Value {
+        lbracket: Ast<PunctLBracket>,
+        value: Ast<Expr>,
+        rbracket: Ast<PunctRBracket>,
+    },    
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Copy, Clone)]
 pub enum BinaryOp {
     Add,
     Sub,
     Mul,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Copy, Clone)]
 pub enum UnaryOp {
     Neg,
     Pos,
@@ -114,10 +121,11 @@ pub enum UnaryOp {
 #[derive(Debug, Serialize)]
 pub enum Expr {
     Ident(SmolStr2),
-    Number(u128),
+    Int(u128),
     String(SmolStr2),
     Bool(bool),
     Hole,
+    Unit,
     Uninit,
     StructDecl {
         kw_struct: Ast<KwStruct>,
@@ -152,6 +160,9 @@ pub enum Expr {
         lbracket: Ast<PunctLBracket>,
         indicators: Vec<(Ast<Expr>, Option<Ast<PunctComma>>)>,
         rbracket: Ast<PunctRBracket>,
+    },
+    PlainType {
+        kw_type: Ast<KwType>,   
     },
     Block {
         lbrace: Ast<PunctLBrace>,

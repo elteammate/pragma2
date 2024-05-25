@@ -4,6 +4,7 @@ import init, {compile} from "pragma-wasm"
 let ready = false
 
 const do_compile = (code: string) => {
+  console.log(code)
   try {
     return compile(code)
   } catch (e: any) {

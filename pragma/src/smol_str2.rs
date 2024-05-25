@@ -1,8 +1,9 @@
 use std::fmt::Debug;
+use std::ops::Deref;
 use serde::Serialize;
 use smol_str::SmolStr;
 
-#[derive(Eq, PartialEq, Clone)]
+#[derive(Eq, PartialEq, Clone, Hash)]
 pub struct SmolStr2(SmolStr);
 
 impl Serialize for SmolStr2 {
@@ -17,6 +18,20 @@ impl Serialize for SmolStr2 {
 impl From<&str> for SmolStr2 {
     fn from(s: &str) -> Self {
         SmolStr2(s.into())
+    }
+}
+
+impl From<String> for SmolStr2 {
+    fn from(s: String) -> Self {
+        SmolStr2(s.into())
+    }
+}
+
+impl Deref for SmolStr2 {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
