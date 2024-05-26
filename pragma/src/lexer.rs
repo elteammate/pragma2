@@ -21,6 +21,8 @@ pub enum Token {
     FnTy,
     #[token("if")]
     If,
+    #[token("else")]
+    Else,
     #[token("while")]
     While,
     #[token("struct")]
@@ -55,6 +57,30 @@ pub enum Token {
     Minus,
     #[token("*")]
     Star,
+    #[token("/")]
+    Slash,
+    #[token("%")]
+    Percent,
+    #[token("|")]
+    Pipe,
+    #[token("^")]
+    Caret,
+    #[token("!")]
+    Bang,
+    #[token("==")]
+    EqEq,
+    #[token("!=")]
+    NotEq,
+    #[token("<")]
+    Lt,
+    #[token("<=")]
+    Le,
+    #[token(">")]
+    Gt,
+    #[token(">=")]
+    Ge,
+    #[token(".")]
+    Dot,
     #[token("&")]
     Ampersand,
     #[regex(r"\d+", |lex| {

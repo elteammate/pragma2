@@ -169,11 +169,11 @@ fn emit_module<'c>(builder: &mut Builder<'c>, module: &'c Module) -> std::fmt::R
         writeln!(builder, "#include <{}>", include)?;
     }
 
-    for (id, struct_) in module.structs.iter().enumerate() {
+    for (id, struct_) in module.structs.iter().enumerate().rev() {
         emit_struct(builder, id, struct_)?;
     }
 
-    for (id, function) in module.functions.iter().enumerate() {
+    for (id, function) in module.functions.iter().enumerate().rev() {
         emit_function(builder, id, function)?;
     }
 
@@ -212,7 +212,7 @@ fn emit_function<'c>(
     let names = LocalNames::new(function);
 
     let mut declared_in_params = vec![false; function.locals.len()];
-    
+
     let mut first = true;
     for &id in function.parameters.iter() {
         if !first {
@@ -294,14 +294,39 @@ fn emit_statement<'c>(
 ) -> std::fmt::Result {
     match stmt {
         Statement::Expression(expr) => {
-            emit_expression(builder, names, &expr, Precedence::Highest, false)?;
+            emit_expression(builder, names, expr, Precedence::Highest, false)?;
         }
         Statement::Return(expr) => {
             write!(builder, "return ")?;
-            emit_expression(builder, names, &expr, Precedence::Highest, false)?;
+            emit_expression(builder, names, expr, Precedence::Highest, false)?;
         }
         Statement::ReturnVoid => {
             write!(builder, "return")?;
+        }
+        Statement::If { cond, then, else_ } => {
+            write!(builder, "if(")?;
+            emit_expression(builder, names, cond, Precedence::Highest, false)?;
+            write!(builder, "){{")?;
+            for stmt in then.iter() {
+                emit_statement(builder, names, stmt)?;
+            }
+            write!(builder, "}}")?;
+            if !else_.is_empty() {
+                write!(builder, "else{{")?;
+                for stmt in else_.iter() {
+                    emit_statement(builder, names, stmt)?;
+                }
+                write!(builder, "}}")?;
+            }
+        }
+        Statement::While { cond, body } => {
+            write!(builder, "while(")?;
+            emit_expression(builder, names, cond, Precedence::Highest, false)?;
+            write!(builder, "){{")?;
+            for stmt in body.iter() {
+                emit_statement(builder, names, stmt)?;
+            }
+            write!(builder, "}}")?;
         }
     }
     write!(builder, ";")
@@ -331,7 +356,7 @@ fn emit_expression<'c>(
     strict: bool,
 ) -> std::fmt::Result {
     let prec = expr.prec();
-    let needs_parens = context_prec < prec || !strict && context_prec == prec;
+    let needs_parens = context_prec < prec || strict && context_prec == prec;
     if needs_parens {
         write!(builder, "(")?;
     }
@@ -340,60 +365,60 @@ fn emit_expression<'c>(
         // TODO: lay out integers properly
         Expr::Int { x } => write!(builder, "{}", x)?,
         // TODO: format string properly
-        Expr::String { s } => write!(builder, "{:?}", &s[..])?,
+        Expr::String { s } => write!(builder, "\"{}\"", &s[..])?,
         Expr::Local { id } => write!(builder, "{}", names.get_local(*id))?,
         Expr::Global { id } => write!(builder, "{}", builder.get_function_name(*id))?,
         Expr::External { id } => write!(builder, "{}", builder.get_external_name(*id))?,
         Expr::Ref { x } => {
             write!(builder, "&")?;
-            emit_expression(builder, names, &x, Precedence::PrefixUnary, true)?;
+            emit_expression(builder, names, x, Precedence::PrefixUnary, true)?;
         }
         Expr::Deref { x } => {
             write!(builder, "*")?;
-            emit_expression(builder, names, &x, Precedence::PrefixUnary, true)?;
+            emit_expression(builder, names, x, Precedence::PrefixUnary, true)?;
         }
         Expr::Call { f, args } => {
-            emit_expression(builder, names, &f, Precedence::SuffixUnary, false)?;
+            emit_expression(builder, names, f, Precedence::SuffixUnary, false)?;
             write!(builder, "(")?;
             emit_comma_separated_list(builder, names, args.iter())?;
             write!(builder, ")")?
         }
         Expr::Assign { lhs, rhs } => {
             write!(builder, "{}=", names.get_local(*lhs))?;
-            emit_expression(builder, names, &rhs, Precedence::Assign, false)?;
+            emit_expression(builder, names, rhs, Precedence::Assign, false)?;
         }
         Expr::Plus { lhs, rhs } => {
-            emit_expression(builder, names, &lhs, Precedence::Add, false)?;
+            emit_expression(builder, names, lhs, Precedence::Add, false)?;
             write!(builder, "+")?;
-            emit_expression(builder, names, &rhs, Precedence::Add, true)?;
+            emit_expression(builder, names, rhs, Precedence::Add, true)?;
         }
         Expr::Minus { lhs, rhs } => {
-            emit_expression(builder, names, &lhs, Precedence::Add, false)?;
+            emit_expression(builder, names, lhs, Precedence::Add, false)?;
             write!(builder, "-")?;
-            emit_expression(builder, names, &rhs, Precedence::Add, true)?;
+            emit_expression(builder, names, rhs, Precedence::Add, true)?;
         }
         Expr::Multiply { lhs, rhs } => {
-            emit_expression(builder, names, &lhs, Precedence::Multiply, false)?;
+            emit_expression(builder, names, lhs, Precedence::Multiply, false)?;
             write!(builder, "*")?;
-            emit_expression(builder, names, &rhs, Precedence::Multiply, true)?;
+            emit_expression(builder, names, rhs, Precedence::Multiply, true)?;
         }
         Expr::UnaryPlus { x } => {
             // it's always a no-op, right?
             // write!(builder, "+")?;
-            emit_expression(builder, names, &x, Precedence::PrefixUnary, true)?;
+            emit_expression(builder, names, x, Precedence::PrefixUnary, true)?;
         }
         Expr::UnaryMinus { x } => {
             write!(builder, "-")?;
-            emit_expression(builder, names, &x, Precedence::PrefixUnary, true)?;
+            emit_expression(builder, names, x, Precedence::PrefixUnary, true)?;
         }
         Expr::Cast { ty, x } => {
             write!(builder, "(")?;
             emit_type(builder, ty.clone())?;
             write!(builder, ")")?;
-            emit_expression(builder, names, &x, Precedence::PrefixUnary, true)?;
+            emit_expression(builder, names, x, Precedence::PrefixUnary, true)?;
         }
         Expr::StructAccess { x, field } => {
-            emit_expression(builder, names, &x, Precedence::SuffixUnary, false)?;
+            emit_expression(builder, names, x, Precedence::SuffixUnary, false)?;
             let field = builder.get_struct_field(*field);
             write!(builder, ".{}", field)?;
         }

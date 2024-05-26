@@ -67,11 +67,16 @@ pub struct KwFn;
 pub struct KwIf;
 
 #[derive(Debug, Serialize)]
+pub struct KwElse;
+
+#[derive(Debug, Serialize)]
 pub struct KwWhile;
 
 #[derive(Debug, Serialize)]
 pub struct KwReturn;
 
+#[derive(Debug, Serialize)]
+pub struct PunctDot;
 
 #[derive(Debug, Serialize)]
 pub struct Module {
@@ -108,10 +113,22 @@ pub enum BinaryOp {
     Add,
     Sub,
     Mul,
+    Div,
+    Rem,
+    And,
+    Xor,
+    Or,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 #[derive(Debug, Serialize, Copy, Clone)]
 pub enum UnaryOp {
+    Not,
     Neg,
     Pos,
     Ref,
@@ -176,6 +193,7 @@ pub enum Expr {
         cond: Box<Ast<Expr>>,
         rparen: Ast<PunctRParen>,
         then: Box<Ast<Expr>>,
+        kw_else: Option<Ast<KwElse>>,
         else_: Option<Box<Ast<Expr>>>,
     },
     While {
@@ -226,5 +244,18 @@ pub enum Expr {
         lparen: Ast<PunctLParen>,
         expr: Box<Ast<Expr>>,
         rparen: Ast<PunctRParen>,
+    },
+    Method {
+        obj: Box<Ast<Expr>>,
+        dot: Ast<PunctDot>,
+        method: Ast<SmolStr2>,
+        lparen: Ast<PunctLParen>,
+        args: Vec<(Ast<Expr>, Option<Ast<PunctComma>>)>,
+        rparen: Ast<PunctRParen>,
+    },
+    Field {
+        obj: Box<Ast<Expr>>,
+        dot: Ast<PunctDot>,
+        field: Ast<SmolStr2>,
     },
 }

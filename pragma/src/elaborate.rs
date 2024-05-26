@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::rc::Rc;
 use indexmap::IndexMap;
 use serde::Serialize;
-use crate::ast::{Ast, BinaryOp, Expr, Item, Module, NodeExt, Param};
+use crate::ast::{Ast, BinaryOp, Expr, Item, Module, NodeExt, Param, UnaryOp};
 use crate::{c, cmrg};
 use crate::compound_result::{CompoundResult, err};
 use crate::intrinsics::{Intrinsic, make_intrinsics};
@@ -36,6 +36,9 @@ pub enum Term {
     Decl { name: SmolStr2, ty: Rc<Term>, val: Rc<Term> },
     Block { stmts: Vec<Rc<Term>>, ret: Rc<Term> },
     Typed { term: Rc<Term>, ty: Rc<Term> },
+    If { cond: Rc<Term>, then: Rc<Term>, else_: Rc<Term> },
+    Assign { lhs: SmolStr2, rhs: Rc<Term> },
+    While { cond: Rc<Term>, body: Rc<Term> },
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +85,8 @@ pub struct Ctx {
     locals: Vec<(SmolStr2, (Rc<Term>, Rc<Term>))>,
     span: Span,
     metas: Vec<(Option<Rc<Term>>, Rc<Term>)>,
+    block_boundaries: Vec<usize>,
+    stop_substitution_mark: bool,
 }
 
 impl Ctx {
@@ -136,6 +141,15 @@ impl Ctx {
         result
     }
 
+    fn with_block<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.block_boundaries.push(self.locals.len());
+        let result = f(self);
+        let bound = self.block_boundaries.pop().unwrap();
+        self.locals.truncate(bound);
+        self.stop_substitution_mark = false;
+        result
+    }
+
     fn with_span<T>(&mut self, span: Span, f: impl FnOnce(&mut Self) -> T) -> T {
         let old = self.span;
         self.span = span;
@@ -149,6 +163,29 @@ impl Ctx {
             self.with_local(name.clone(), pat.clone(), pat.clone(), f)
         } else {
             f(self)
+        }
+    }
+
+    fn consider(&mut self, term: &Rc<Term>) {
+        assert!(!self.block_boundaries.is_empty());
+        match &**term {
+            Term::Decl { name, ty, val } => {
+                self.locals.push((name.clone(), (local(name.clone()), ty.clone())));
+                self.consider(val);
+            }
+            Term::Call { obj, args } => {
+                self.consider(obj);
+                for arg in args {
+                    self.consider(arg);
+                }
+            }
+            Term::Typed { term, .. } => {
+                self.consider(term);
+            }
+            Term::Source { term, .. } => {
+                self.consider(term);
+            }
+            _ => {}
         }
     }
 
@@ -192,8 +229,8 @@ fn fresh_common(ctx: &mut Ctx, a: SmolStr2, b: SmolStr2) -> SmolStr2 {
     })
 }
 
-fn type_of(ctx: &mut Ctx, term: Rc<Term>) -> Rc<Term> {
-    match &*term {
+fn type_of(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
+    Ok(match &*term {
         Term::Var(ident) => ctx.lookup(ident.clone()).expect("Ident not found").1.clone(),
         Term::Meta(id) => ctx.metas[*id].1.clone(),
         Term::Undef => ctx.undef.clone(),
@@ -207,23 +244,26 @@ fn type_of(ctx: &mut Ctx, term: Rc<Term>) -> Rc<Term> {
         Term::BoolTy => ctx.star.clone(),
         Term::UnitTy => ctx.star.clone(),
         Term::Call { obj, .. } => {
-            let obj_ty = type_of(ctx, obj.clone());
+            let obj_ty = type_of(ctx, obj.clone())?;
             let obj_ty = nf(ctx, obj_ty).expect("Typed code failed to normalize");
             match &*obj_ty {
                 Term::FnTy { ret_ty, .. } => ret_ty.clone(),
-                _ => panic!("Calling not-function in typed code"),
+                _ => return err(ElaborateError::Commented(
+                    ctx.span,
+                    format!("Expected a function, got `{}`", obj_ty),
+                )),
             }
         }
         Term::Pi { .. } => ctx.star.clone(), // TODO: maybe filter out indicators properly
         Term::Lam { ident, ty, body } => {
-            ctx.with_local(ident.clone(), ctx.undef.clone(), ctx.undef.clone(), |ctx| {
-                let body = type_of(ctx, body.clone());
-                Rc::new(Term::Pi { ident: ident.clone(), ty: ty.clone(), body })
-            })
+            ctx.with_local(ident.clone(), local(ident.clone()), ty.clone(), |ctx| {
+                let body = type_of(ctx, body.clone())?;
+                Result::Ok(Rc::new(Term::Pi { ident: ident.clone(), ty: ty.clone(), body }))
+            })?
         }
         Term::FnTy { .. } => ctx.star.clone(),
         Term::App { obj, arg } => {
-            let obj_ty = type_of(ctx, obj.clone());
+            let obj_ty = type_of(ctx, obj.clone())?;
             Rc::new(Term::App {
                 obj: obj_ty.clone(),
                 arg: arg.clone(),
@@ -232,27 +272,35 @@ fn type_of(ctx: &mut Ctx, term: Rc<Term>) -> Rc<Term> {
         Term::Match { obj, cases, default } => {
             let cases = cases.iter().map(|(pat, body)| {
                 ctx.with_case(obj.clone(), pat.clone(), |ctx| {
-                    let body_ty = type_of(ctx, body.clone());
-                    (pat.clone(), body_ty)
+                    let body_ty = type_of(ctx, body.clone())?;
+                    Ok((pat.clone(), body_ty))
                 })
-            }).collect();
-            let default_ty = type_of(ctx, default.clone());
+            }).collect::<Result<_>>()?;
+            let default_ty = type_of(ctx, default.clone())?;
             Rc::new(Term::Match { obj: obj.clone(), cases, default: default_ty.clone() })
         }
         Term::Fn { args, body } => {
             let ret_ty = ctx.with_local_decls(args, |ctx| {
                 type_of(ctx, body.clone())
-            });
+            })?;
             Rc::new(Term::FnTy { args: args.iter().map(|(_, ty)| ty).cloned().collect(), ret_ty })
         }
-        Term::Source { term, .. } => type_of(ctx, term.clone()),
-        Term::Block { ret, .. } => {
-            type_of(ctx, ret.clone())
+        Term::Source { term, .. } => return type_of(ctx, term.clone()),
+        Term::Block { ret, stmts } => {
+            return ctx.with_block(|ctx| {
+                for stmt in stmts {
+                    ctx.consider(stmt);
+                }
+                type_of(ctx, ret.clone())
+            })
         }
         Term::Decl { .. } => ctx.unit_ty.clone(),
         Term::Typed { ty, .. } => ty.clone(),
         Term::Intrinsic(intrinsic) => intrinsic.type_of(),
-    }
+        Term::If { then, .. } => return type_of(ctx, then.clone()),
+        Term::Assign { .. } => ctx.unit_ty.clone(),
+        Term::While { .. } => ctx.unit_ty.clone(),
+    })
 }
 
 pub fn elaborate(module: &Module) -> Result<Ctx> {
@@ -268,6 +316,8 @@ pub fn elaborate(module: &Module) -> Result<Ctx> {
         locals: Vec::new(),
         span: Span(0, 0),
         metas: Vec::new(),
+        block_boundaries: Vec::new(),
+        stop_substitution_mark: false,
     };
 
     for item in &module.items {
@@ -352,7 +402,7 @@ fn elaborate_item(ctx: &mut Ctx, item: &Item) -> Result<()> {
         let (new, _) = elaborate_item_impl(ctx, item, 0)?;
 
         let new = nf(ctx, new)?;
-        let new_ty = type_of(ctx, new.clone());
+        let new_ty = type_of(ctx, new.clone())?;
         let new_ty = nf(ctx, new_ty)?;
 
         if contains_metas(&new) || contains_metas(&new_ty) {
@@ -378,7 +428,7 @@ fn elaborate_item(ctx: &mut Ctx, item: &Item) -> Result<()> {
 
         let value = nf(ctx, value)?;
         // let ty = nf(ctx, ty)?;
-        let ty = type_of(ctx, value.clone());
+        let ty = type_of(ctx, value.clone())?;
         let ty = nf(ctx, ty)?;
 
         ctx.items.insert(item.ident.node.clone(), (value, ty));
@@ -405,7 +455,7 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
             Expr::Paren { expr, .. } => return infer(ctx, expr),
             Expr::Hole => {
                 let meta = ctx.fresh_meta();
-                return Ok((meta.clone(), type_of(ctx, meta)));
+                return Ok((meta.clone(), type_of(ctx, meta)?));
             }
             Expr::Uninit => (Term::Undef, Term::Undef),
 
@@ -503,6 +553,35 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
                 ));
             }
 
+            Expr::Unary { op, expr } => {
+                let (expr, ty) = infer(ctx, expr)?;
+                let item = SmolStr2::from(match op.node {
+                    UnaryOp::Neg => "neg",
+                    UnaryOp::Pos => "pos",
+                    UnaryOp::Not => "not",
+                    UnaryOp::Ref => "ref",
+                    UnaryOp::Deref => "deref",
+                });
+
+                if ctx.lookup(item.clone()).is_none() {
+                    return err(ElaborateError::Commented(
+                        op.span,
+                        format!("Unary operator `{}` not found", &item[..]),
+                    ));
+                }
+
+                let term = Rc::new(Term::Call {
+                    obj: Rc::new(Term::App {
+                        obj: Rc::new(Term::Var(item.clone())),
+                        arg: ty.clone(),
+                    }),
+                    args: vec![expr],
+                });
+
+                let ty = type_of(ctx, term.clone())?;
+                return Ok((term, ty));
+            }
+
             Expr::Binary { op, lhs, rhs } => {
                 let (lhs, lhs_ty) = infer(ctx, lhs)?;
                 let (rhs, rhs_ty) = infer(ctx, rhs)?;
@@ -511,6 +590,17 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
                     BinaryOp::Add => "add",
                     BinaryOp::Sub => "sub",
                     BinaryOp::Mul => "mul",
+                    BinaryOp::Div => "div",
+                    BinaryOp::Rem => "rem",
+                    BinaryOp::And => "and",
+                    BinaryOp::Or => "or",
+                    BinaryOp::Xor => "xor",
+                    BinaryOp::Eq => "eq",
+                    BinaryOp::Ne => "ne",
+                    BinaryOp::Lt => "lt",
+                    BinaryOp::Le => "le",
+                    BinaryOp::Gt => "gt",
+                    BinaryOp::Ge => "ge",
                 });
 
                 if ctx.lookup(item.clone()).is_none() {
@@ -531,9 +621,109 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
                     args: vec![lhs, rhs],
                 });
 
-                let ty = type_of(ctx, term.clone());
+                let ty = type_of(ctx, term.clone())?;
                 return Ok((term, ty));
             }
+
+            Expr::Block { stmts, ret, .. } => {
+                return ctx.with_block(|ctx| {
+                    let stmts = stmts.iter().map(
+                        |stmt| {
+                            let (val, ty) = infer(ctx, &stmt.0)?;
+                            ctx.consider(&val);
+                            Ok((val, ty))
+                        }
+                    ).collect::<Result<Vec<_>>>()?;
+
+                    let (ret, ret_ty) = if let Some(ret) = ret {
+                        infer(ctx, ret)?
+                    } else {
+                        (ctx.unit.clone(), ctx.unit_ty.clone())
+                    };
+
+                    Ok((
+                        Rc::new(Term::Block {
+                            stmts: stmts.iter().map(|(stmt, _)| stmt.clone()).collect(),
+                            ret,
+                        }),
+                        ret_ty,
+                    ))
+                })
+            }
+
+            Expr::Decl { ident, ty, val , .. } => {
+                let ty = ty.as_ref().map(|ty| check(ctx, ty, &mut ctx.star.clone())).transpose()?;
+                let (val, ty) = if let Some(mut ty) = ty {
+                    let val = check(ctx, val, &mut ty)?;
+                    (val, ty)
+                } else {
+                    infer(ctx, val)?
+                };
+                return Ok((
+                    Rc::new(Term::Decl {
+                        name: ident.node.clone(),
+                        ty,
+                        val,
+                    }),
+                    ctx.unit_ty.clone(),
+                ))
+            }
+
+            Expr::If { cond, then, else_, .. } => {
+                let cond = check(ctx, &cond, &mut Rc::new(Term::BoolTy))?;
+                let (then, then_ty) = infer(ctx, then)?;
+
+                let (else_, else_ty) = if let Some(else_) = else_ {
+                    infer(ctx, else_)?
+                } else {
+                    (ctx.unit.clone(), ctx.unit_ty.clone())
+                };
+
+                let ty = unify(ctx, then_ty.clone(), else_ty.clone())
+                    .with_comment("If branches types must match")?;
+
+                return Ok((
+                    Rc::new(Term::If {
+                        cond,
+                        then,
+                        else_,
+                    }),
+                    ty,
+                ))
+            }
+            
+            Expr::Assign { lvalue, value, .. } => {
+                let (lvalue, mut ty) = infer(ctx, lvalue)?;
+                let value = check(ctx, value, &mut ty)
+                    .with_comment("Can't assign because of type mismatch")?;
+                
+                return Ok((
+                    Rc::new(Term::Assign {
+                        lhs: match &*lvalue {
+                            Term::Var(name) => name.clone(),
+                            _ => return err(ElaborateError::Commented(
+                                ctx.span,
+                                format!("Can't assign to `{}`", lvalue),
+                            )),
+                        },
+                        rhs: value,
+                    }),
+                    ctx.unit_ty.clone(),
+                ))
+            }
+            
+            Expr::While { cond, body, .. } => {
+                let cond = check(ctx, &cond, &mut Rc::new(Term::BoolTy))?;
+                let (body, _) = infer(ctx, body)?;
+                return Ok((
+                    Rc::new(Term::While {
+                        cond,
+                        body,
+                    }),
+                    ctx.unit_ty.clone(),
+                ))
+            }
+            
 
             _ => todo!("Can't infer type of expression yet {:#?}", expr.node),
         };
@@ -561,15 +751,14 @@ fn check(ctx: &mut Ctx, expr: &Ast<Expr>, ty: &mut Rc<Term>) -> Result<Rc<Term>>
 fn unify(ctx: &mut Ctx, a: Rc<Term>, b: Rc<Term>) -> Result<Rc<Term>> {
     let a = nf(ctx, a)?;
     let b = nf(ctx, b)?;
-    eprintln!("Unifying `{}` and `{}`", a, b);
     use Term::*;
 
     let result = match (&*a, &*b) {
         (_, Undef) => return Ok(a.clone()),
         (Undef, _) => return Ok(b.clone()),
         (Meta(id), _) => {
-            let a_ty = type_of(ctx, a.clone());
-            let b_ty = type_of(ctx, b.clone());
+            let a_ty = type_of(ctx, a.clone())?;
+            let b_ty = type_of(ctx, b.clone())?;
             unify(ctx, a_ty, b_ty.clone())?;
             if let Some(value) = &ctx.metas[*id].0 {
                 return unify(ctx, value.clone(), b);
@@ -578,8 +767,8 @@ fn unify(ctx: &mut Ctx, a: Rc<Term>, b: Rc<Term>) -> Result<Rc<Term>> {
             return Ok(b);
         }
         (_, Meta(id)) => {
-            let a_ty = type_of(ctx, a.clone());
-            let b_ty = type_of(ctx, b.clone());
+            let a_ty = type_of(ctx, a.clone())?;
+            let b_ty = type_of(ctx, b.clone())?;
             unify(ctx, a_ty.clone(), b_ty)?;
             if let Some(value) = &ctx.metas[*id].0 {
                 return unify(ctx, a, value.clone());
@@ -889,9 +1078,12 @@ fn is_concrete(term: &Rc<Term>) -> bool {
         Term::StringTy => true,
         Term::BoolTy => true,
         Term::UnitTy => true,
-        Term::Fn { .. } => todo!(),
-        Term::Call { .. } => todo!(),
-        Term::FnTy { .. } => todo!(),
+        Term::Fn { body, args } =>
+            is_concrete(body) && args.iter().all(|(_, ty)| is_concrete(ty)),
+        Term::Call { obj, args } =>
+            is_concrete(obj) && args.iter().all(is_concrete),
+        Term::FnTy { args, ret_ty } =>
+            args.iter().all(is_concrete) && is_concrete(ret_ty),
         Term::Source { term, .. } => is_concrete(term),
         Term::Pi { body, ty, .. } => is_concrete(body) && is_concrete(ty),
         Term::Lam { body, ty, .. } => is_concrete(body) && is_concrete(ty),
@@ -900,7 +1092,10 @@ fn is_concrete(term: &Rc<Term>) -> bool {
         Term::Decl { ty, val, .. } => is_concrete(ty) && is_concrete(val),
         Term::Block { stmts, ret } => stmts.iter().all(is_concrete) && is_concrete(ret),
         Term::Typed { ty, term } => is_concrete(ty) && is_concrete(term),
+        Term::If { cond, then, else_ } => is_concrete(cond) && is_concrete(then) && is_concrete(else_),
         Term::Intrinsic(_) => true,
+        Term::Assign { rhs, .. } => is_concrete(rhs),
+        Term::While { .. } => false,
     }
 }
 
@@ -938,7 +1133,10 @@ fn contains_metas(term: &Rc<Term>) -> bool {
         Term::Decl { ty, val, .. } => contains_metas(ty) || contains_metas(val),
         Term::Block { stmts, ret } => stmts.iter().any(contains_metas) || contains_metas(ret),
         Term::Typed { ty, term } => contains_metas(ty) || contains_metas(term),
+        Term::If { cond, then, else_ } => contains_metas(cond) || contains_metas(then) || contains_metas(else_),
         Term::Intrinsic(_) => false,
+        Term::Assign { rhs, .. } => contains_metas(rhs),
+        Term::While { cond, body } => contains_metas(cond) || contains_metas(body),
     }
 }
 
@@ -1058,24 +1256,33 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
         Term::Source { term, span } => {
             ctx.with_span(*span, |ctx| nf(ctx, term.clone()))
         }
+        Term::Typed { ty, term } => {
+            let ty = nf(ctx, ty.clone())?;
+            let term = nf(ctx, term.clone())?;
+            Ok(Rc::new(Term::Typed { ty, term }))
+        }
         Term::Call { obj, args } => {
             let obj = nf(ctx, obj.clone())?;
             let args = args.iter().map(|arg| nf(ctx, arg.clone())).collect::<Result<Vec<_>>>()?;
             match &*obj {
                 Term::Fn { args: args_decl, body } => {
-                    let locals = args.iter().zip(args_decl)
-                        .map(|(val, (ident, ty))| {
-                            (ident.clone(), (val.clone(), ty.clone()))
-                        }).collect::<Vec<_>>();
-                    ctx.with_locals(&locals, |ctx| {
-                        nf(ctx, body.clone())
-                    })
+                    if args.iter().all(is_concrete) {
+                        let locals = args.iter().zip(args_decl)
+                            .map(|(val, (ident, ty))| {
+                                (ident.clone(), (val.clone(), ty.clone()))
+                            }).collect::<Vec<_>>();
+                        ctx.with_locals(&locals, |ctx| {
+                            nf(ctx, body.clone())
+                        })
+                    } else {
+                        Ok(Rc::new(Term::Call { obj, args }))
+                    }
                 }
                 Term::Intrinsic(intrinsic) => {
                     if intrinsic.can_call() && args.iter().all(is_concrete) {
                         intrinsic.call(args)
                     } else {
-                        Ok(term)
+                        Ok(Rc::new(Term::Call { obj, args }))
                     }
                 }
                 Term::Match { obj, cases, default } => {
@@ -1093,7 +1300,7 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
                     })).unwrap_or(ctx.undef.clone());
                     Ok(Rc::new(Term::Match { obj: obj.clone(), cases, default }))
                 }
-                _ => Ok(term),
+                _ => Ok(Rc::new(Term::Call { obj, args })),
             }
         }
         Term::Fn { args, body } => {
@@ -1114,7 +1321,56 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
             let ty = nf(ctx, ty.clone())?;
             Ok(Rc::new(Term::Decl { val, ty, name: name.clone() }))
         }
-        _ => Ok(term),
+        Term::Block { stmts, ret } => {
+            ctx.with_block(|ctx| {
+                let stmts = stmts.iter().map(
+                    |stmt| {
+                        let res= nf(ctx, stmt.clone())?;
+                        ctx.consider(&res);
+                        Ok(res)
+                    }).collect::<Result<Vec<_>>>()?;
+
+                let ret = nf(ctx, ret.clone())?;
+
+                Ok(Rc::new(Term::Block { stmts, ret }))
+            })
+        }
+        Term::If { cond, then, else_ } => {
+            let cond = nf(ctx, cond.clone())?;
+            let then = nf(ctx, then.clone())?;
+            let else_ = nf(ctx, else_.clone())?;
+            if is_concrete(&cond) {
+                if let Term::Bool(true) = &*cond {
+                    return nf(ctx, then);
+                } else if let Term::Bool(false) = &*cond {
+                    return nf(ctx, else_);
+                } else {
+                    panic!("Non-boolean condition in if expression");
+                }
+            } else {
+                Ok(Rc::new(Term::If { cond, then, else_ }))
+            }
+        }
+        Term::Assign { lhs, rhs } => {
+            let rhs = nf(ctx, rhs.clone())?;
+            Ok(Rc::new(Term::Assign { lhs: lhs.clone(), rhs }))
+        }
+        Term::While { cond, body } => {
+            let cond = nf(ctx, cond.clone())?;
+            let body = nf(ctx, body.clone())?;
+            Ok(Rc::new(Term::While { cond, body }))
+        }
+
+        Term::Undef => Ok(term),
+        Term::Int(_) => Ok(term),
+        Term::String(_) => Ok(term),
+        Term::Bool(_) => Ok(term),
+        Term::Unit => Ok(term),
+        Term::IntTy => Ok(term),
+        Term::StringTy => Ok(term),
+        Term::BoolTy => Ok(term),
+        Term::UnitTy => Ok(term),
+        Term::Intrinsic(_) => Ok(term),
     }
 }
 
@@ -1197,10 +1453,41 @@ fn substitute(ctx: &mut Ctx, term: Rc<Term>, name: SmolStr2, subs: Rc<Term>) -> 
         Term::Source { term, .. } => substitute(ctx, term.clone(), name, subs),
         Term::Decl { val, ty, name: ident } => {
             let val = substitute(ctx, val.clone(), name.clone(), subs.clone());
-            let ty = substitute(ctx, ty.clone(), name, subs);
+            let ty = substitute(ctx, ty.clone(), name.clone(), subs);
+            if ident == &name {
+                ctx.stop_substitution_mark = true;
+            }
             Rc::new(Term::Decl { name: ident.clone(), val, ty })
         }
-        Term::Block { .. } => todo!(),
+        Term::Block { stmts, ret } => {
+            ctx.with_block(|ctx| {
+                let stmts = stmts.iter().map(|stmt| {
+                    if !ctx.stop_substitution_mark {
+                        let stmt = substitute(ctx, stmt.clone(), name.clone(), subs.clone());
+                        ctx.consider(&stmt);
+                        stmt
+                    } else {
+                        stmt.clone()
+                    }
+                }).collect();
+                if !ctx.stop_substitution_mark {
+                    let ret = substitute(ctx, ret.clone(), name, subs);
+                    Rc::new(Term::Block { stmts, ret })
+                } else {
+                    Rc::new(Term::Block { stmts, ret: ret.clone() })
+                }
+            })
+        },
+        Term::If { cond, then, else_ } => {
+            let cond = substitute(ctx, cond.clone(), name.clone(), subs.clone());
+            let then = substitute(ctx, then.clone(), name.clone(), subs.clone());
+            let else_ = substitute(ctx, else_.clone(), name, subs);
+            Rc::new(Term::If { cond, then, else_ })
+        }
+        Term::Assign { lhs, rhs } => {
+            let rhs = substitute(ctx, rhs.clone(), name, subs);
+            Rc::new(Term::Assign { lhs: lhs.clone(), rhs })
+        }
         _ => term,
     }
 }
@@ -1232,6 +1519,47 @@ fn free_vars(ctx: &mut Ctx, term: Rc<Term>) -> Vec<SmolStr2> {
             free.append(&mut free_vars(ctx, default.clone()));
             free
         }
+        Term::Source { term, .. } => free_vars(ctx, term.clone()),
+        Term::Fn { args, body } => {
+            let mut free = free_vars(ctx, body.clone());
+            for (_, ty) in args {
+                free.append(&mut free_vars(ctx, ty.clone()));
+            }
+            free.retain(|x| args.iter().all(|(ident, _)| ident != x));
+            free
+        }
+        Term::FnTy { args, ret_ty } => {
+            let mut free = free_vars(ctx, ret_ty.clone());
+            for ty in args {
+                free.append(&mut free_vars(ctx, ty.clone()));
+            }
+            free
+        }
+        Term::Call { obj, args } => {
+            let mut free = free_vars(ctx, obj.clone());
+            for arg in args {
+                free.append(&mut free_vars(ctx, arg.clone()));
+            }
+            free
+        }
+        Term::Decl { val, ty, .. } => {
+            let mut free = free_vars(ctx, val.clone());
+            free.append(&mut free_vars(ctx, ty.clone()));
+            free
+        }
+        Term::Block { stmts, ret } => {
+            let mut free = stmts.iter().flat_map(|stmt| free_vars(ctx, stmt.clone())).collect::<Vec<_>>();
+            free.append(&mut free_vars(ctx, ret.clone()));
+            free
+        }
+        Term::If { cond, then, else_ } => {
+            let mut free = free_vars(ctx, cond.clone());
+            free.append(&mut free_vars(ctx, then.clone()));
+            free.append(&mut free_vars(ctx, else_.clone()));
+            free
+        }
+        Term::Assign { rhs, .. } => free_vars(ctx, rhs.clone()),
+
         _ => Vec::new(),
     }
 }
@@ -1264,7 +1592,13 @@ impl Display for Term {
             Term::StringTy => write!(f, "string"),
             Term::BoolTy => write!(f, "bool"),
             Term::UnitTy => write!(f, "unit"),
-            Term::Fn { .. } => write!(f, "<function>"),
+            Term::Fn { args, body } => {
+                write!(f, "fn(")?;
+                for (ident, ty) in args {
+                    write!(f, "{}: {},", ident, ty)?;
+                }
+                write!(f, ") {}", body)
+            },
             Term::FnTy { args, ret_ty } => {
                 write!(f, "Fn(")?;
                 for ty in args {
@@ -1298,17 +1632,20 @@ impl Display for Term {
             Term::Source { term, .. } => write!(f, "{}", term),
             Term::Decl { name, val, ty } => write!(f, "{}: {} = {}", &name[..], ty, val),
             Term::Block { stmts, ret } => {
-                writeln!(f, "{1:0$}{{", indent, "")?;
+                writeln!(f, "{{")?;
                 INDENT.with(|i| *i.borrow_mut() += 4);
                 for stmt in stmts {
-                    writeln!(f, "{1:0$}{};", indent, stmt)?;
+                    writeln!(f, "{1:0$}{2};", indent + 4, "", stmt)?;
                 }
-                writeln!(f, "{1:0$}{}", indent, ret)?;
+                writeln!(f, "{1:0$}{2}", indent + 4, "", ret)?;
                 INDENT.with(|i| *i.borrow_mut() -= 4);
                 write!(f, "{1:0$}}}", indent, "")
             }
+            Term::Assign { lhs, rhs } => write!(f, "{} = {}", lhs, rhs),
             Term::Typed { term, ty } => write!(f, "({})::{}", term, ty),
             Term::Intrinsic(intrinsic) => write!(f, "<{}>", &intrinsic.name()[..]),
+            Term::If { cond, then, else_ } => write!(f, "if {} then {} else {}", cond, then, else_),
+            Term::While { cond, body } => write!(f, "while {} do {}", cond, body),
         }
     }
 }
@@ -1326,34 +1663,23 @@ struct FnBuilder {
     locals: Vec<c::CType>,
 }
 
-struct BlockBuilder<'a> {
-    previous: Option<&'a mut BlockBuilder<'a>>,
+struct BlockBuilder {
     locals: HashMap<SmolStr2, usize>,
     statements: Vec<c::Statement>,
 }
 
-pub struct Extraction<'a, 'b> {
+pub struct Extraction<'a> {
     pub ctx: &'a mut Ctx,
-    pub b: &'a mut Builder,
-    pub fb: &'a mut FnBuilder,
-    pub bb: &'a mut BlockBuilder<'b>,
+    b: &'a mut Builder,
+    fb: &'a mut FnBuilder,
+    bb: &'a mut Vec<BlockBuilder>,
 }
 
-impl<'a, 'b> Extraction<'a, 'b> {
+impl<'a> Extraction<'a> {
     fn lookup_local(&self, name: &SmolStr2) -> Option<usize> {
-        let mut bb = &self.bb;
-        loop {
-            if let Some(id) = bb.locals.get(name) {
-                return Some(*id);
-            }
-            if let Some(previous) = &bb.previous {
-                bb = previous;
-            } else {
-                return None;
-            }
-        }
+        self.bb.iter().rev().find_map(|bb| bb.locals.get(name).copied())
     }
-    
+
     pub fn add_external(&mut self, name: SmolStr2, init: impl FnOnce() -> (Vec<SmolStr2>, c::ExternalFunction)) -> usize {
         if let Some(id) = self.b.added_externals.get(&name) {
             *id
@@ -1367,9 +1693,57 @@ impl<'a, 'b> Extraction<'a, 'b> {
                     self.b.includes.push(include);
                 }
             }
-            
+
             id
         }
+    }
+
+    fn temp(&mut self, ty: c::CType) -> usize {
+        let id = self.fb.locals.len();
+        self.fb.locals.push(ty);
+        id
+    }
+
+    fn new_local(&mut self, name: SmolStr2, ty: c::CType) -> usize {
+        let id = self.temp(ty);
+        self.bb.last_mut().unwrap().locals.insert(name, id);
+        id
+    }
+
+    fn add_statement(&mut self, statement: c::Statement) {
+        self.bb.last_mut().unwrap().statements.push(statement);
+    }
+
+    fn add_expr(&mut self, ty: c::CType, expr: Box<c::Expr>) -> c::Expr {
+        let id = self.temp(ty);
+        self.add_statement(c::Statement::Expression(c::Expr::Assign {
+            lhs: id,
+            rhs: expr,
+        }));
+        c::Expr::Local { id }
+    }
+
+    fn with_block<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.bb.push(BlockBuilder {
+            locals: HashMap::new(),
+            statements: vec![],
+        });
+        let res = f(self);
+        let bb = self.bb.pop().unwrap();
+        for stmt in bb.statements {
+            self.add_statement(stmt);
+        }
+        res
+    }
+
+    fn build_block<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, Vec<c::Statement>) {
+        self.bb.push(BlockBuilder {
+            locals: HashMap::new(),
+            statements: vec![],
+        });
+        let res = f(self);
+        let statements = self.bb.pop().unwrap().statements;
+        (res, statements)
     }
 }
 
@@ -1407,8 +1781,8 @@ fn extract_fn(ctx: &mut Ctx, b: &mut Builder, term: Rc<Term>) -> Result<usize> {
         return Ok(id);
     }
 
-    let ty = type_of(ctx, term.clone());
-    
+    let ty = type_of(ctx, term.clone())?;
+
     let Term::FnTy { ret_ty, .. } = &*ty else {
         return err(ElaborateError::Commented(
             ctx.span,
@@ -1434,7 +1808,7 @@ fn extract_fn(ctx: &mut Ctx, b: &mut Builder, term: Rc<Term>) -> Result<usize> {
     let locals = args.iter()
         .flat_map(|(_, ty)| extract_c_type(ctx, b, ty).transpose())
         .collect::<Result<Vec<_>>>()?;
-    
+
     let parameters = (0..locals.len()).collect();
 
     b.functions.push(c::Function {
@@ -1448,28 +1822,36 @@ fn extract_fn(ctx: &mut Ctx, b: &mut Builder, term: Rc<Term>) -> Result<usize> {
         locals,
     };
 
-    let mut bb = BlockBuilder {
-        previous: None,
-        locals: HashMap::new(),
+    let mut bb = vec![BlockBuilder {
+        locals: {
+            let mut map = HashMap::new();
+            for (i, (name, _)) in args.iter().enumerate() {
+                map.insert(name.clone(), i);
+            }
+            map
+        },
         statements: vec![],
-    };
+    }];
 
-    let expr = extract_c_expr(&mut Extraction {
+    let mut e = Extraction {
         ctx,
         b,
         fb: &mut fb,
         bb: &mut bb,
-    }, body.clone())?;
+    };
+
+    let expr = extract_c_expr(&mut e, body.clone())?;
 
     if let Some(expr) = expr {
         if !zero_sized_return {
-            bb.statements.push(c::Statement::Return(expr));
+            e.add_statement(c::Statement::Return(expr));
         } else {
-            bb.statements.push(c::Statement::Expression(expr));
+            e.add_statement(c::Statement::Expression(expr));
         }
     }
 
-    b.functions[id].body = bb.statements;
+    assert_eq!(1, e.bb.len());
+    b.functions[id].body = e.bb.pop().unwrap().statements;
     b.functions[id].locals = fb.locals;
 
     Ok(id)
@@ -1564,7 +1946,7 @@ fn extract_c_expr(e: &mut Extraction, term: Rc<Term>) -> Result<Option<c::Expr>>
                     );
 
                     for stmt in stmts {
-                        e.bb.statements.push(stmt);
+                        e.add_statement(stmt);
                     }
 
                     Ok(expr)
@@ -1589,10 +1971,120 @@ fn extract_c_expr(e: &mut Extraction, term: Rc<Term>) -> Result<Option<c::Expr>>
         },
 
         Term::Decl { ty, val, name } => {
-            todo!("variables are not yet implemented")
+            let ty = extract_c_type(e.ctx, e.b, ty)?;
+            let val = extract_c_expr(e, val.clone())?;
+            if let Some(ty) = ty {
+                let var = e.new_local(name.clone(), ty);
+                e.add_statement(c::Statement::Expression(
+                    c::Expr::Assign {
+                        lhs: var,
+                        rhs: Box::new(val.unwrap()),
+                    }
+                ));
+            } else if let Some(expr) = val {
+                e.add_statement(c::Statement::Expression(expr));
+            }
+            Ok(None)
         }
-        Term::Block { .. } => {
-            todo!("blocks are not yet implemented")
+        Term::Block { stmts, ret } => {
+            e.with_block(|e| {
+                for stmt in stmts {
+                    let expr = extract_c_expr(e, stmt.clone())?;
+
+                    if let Some(expr) = expr {
+                        e.add_statement(c::Statement::Expression(expr));
+                    }
+                }
+
+                let ret_ty = type_of(e.ctx, ret.clone())?;
+                if let Some(ty) = extract_c_type(e.ctx, e.b, &ret_ty)? {
+                    let expr = extract_c_expr(e, ret.clone())?;
+                    Ok(Some(e.add_expr(ty, Box::new(expr.unwrap()))))
+                } else {
+                    let expr = extract_c_expr(e, ret.clone())?;
+                    if let Some(expr) = expr {
+                        e.add_statement(c::Statement::Expression(expr));
+                    }
+                    Ok(None)
+                }
+            })
+        }
+        Term::If { cond, then, else_ } => {
+            let cond = extract_c_expr(e, cond.clone())?.expect("ICE: If condition is not boolean");
+            let cond = e.add_expr(c::CType::Int, Box::new(cond));
+
+            let ty = type_of(e.ctx, then.clone())?;
+            let ty = extract_c_type(e.ctx, e.b, &ty)?;
+            let temp = ty.map(|ty| e.temp(ty));
+
+            let (res, then) = e.build_block(|e| {
+                let then = extract_c_expr(e, then.clone())?;
+                if let Some(temp) = temp {
+                    e.add_statement(c::Statement::Expression(c::Expr::Assign {
+                        lhs: temp,
+                        rhs: Box::new(then.unwrap()),
+                    }));
+                } else if let Some(then) = then {
+                    e.add_statement(c::Statement::Expression(then));
+                }
+                Result::Ok(())
+            });
+            res?;
+
+            let (res, else_) = e.build_block(|e| {
+                let else_ = extract_c_expr(e, else_.clone())?;
+                if let Some(temp) = temp {
+                    e.add_statement(c::Statement::Expression(c::Expr::Assign {
+                        lhs: temp,
+                        rhs: Box::new(else_.unwrap()),
+                    }));
+                } else if let Some(else_) = else_ {
+                    e.add_statement(c::Statement::Expression(else_));
+                }
+                Result::Ok(())
+            });
+            res?;
+
+            e.add_statement(c::Statement::If {
+                cond,
+                then,
+                else_,
+            });
+
+            Ok(temp.map(|temp| c::Expr::Local { id: temp }))
+        }
+        Term::Assign { lhs, rhs } => {
+            let var = e.lookup_local(lhs);
+            let rhs = extract_c_expr(e, rhs.clone())?;
+            if let Some(var) = var {
+                e.add_statement(c::Statement::Expression(c::Expr::Assign {
+                    lhs: var,
+                    rhs: Box::new(rhs.unwrap()),
+                }));
+            } else {
+                e.add_statement(c::Statement::Expression(rhs.unwrap()));
+            }
+            Ok(None)
+        }
+        Term::While { cond, body } => {
+            let cond = extract_c_expr(e, cond.clone())?
+                .expect("ICE: While condition is not boolean");
+            
+            let (res, body) = e.build_block(|e| {
+                let body = extract_c_expr(e, body.clone())?;
+                if let Some(body) = body {
+                    e.add_statement(c::Statement::Expression(body));
+                }
+                Result::Ok(())
+            });
+            res?;
+
+            e.add_statement(c::Statement::While {
+                cond,
+                body,
+            });
+
+            Ok(None)
         }
     }
 }

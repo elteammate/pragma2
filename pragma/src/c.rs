@@ -56,6 +56,15 @@ pub enum Statement {
     Expression(Expr),
     Return(Expr),
     ReturnVoid,
+    If {
+        cond: Expr,
+        then: Vec<Statement>,
+        else_: Vec<Statement>,
+    },
+    While {
+        cond: Expr,
+        body: Vec<Statement>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

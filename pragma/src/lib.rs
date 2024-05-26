@@ -39,7 +39,7 @@ pub fn compile(input: &str) -> Result<Output, CompileError> {
 
     let c = elaborate::extract_c(&mut ctx).map_err(CompileError::ElaborateError)?;
     let c = emit::emit(&c);
-    
+
     Ok(Output {
         ast,
         ctx: String::from_utf8(buffer).unwrap(),
@@ -53,8 +53,21 @@ fn test() {
 add [int], [int] = __intrinsic_int_add;
 sub [int], [int] = __intrinsic_int_sub;
 mul [int], [int] = __intrinsic_int_mul;
-f = fn(x: int, y: int) x + y;
-main = fn() f(2, 2);
+div [int], [int] = __intrinsic_int_mul;
+lt [int], [int] = fn(x: int, y: int) true;
+
+hard_math = 2 + 2 / 5;
+
+puts = __intrinsic_puts;
+
+f = fn(x: int, y: int) x + y * 3;
+
+main = fn() {
+  x := 0;
+  while(x < 500) {
+    x = x + 1;
+  }
+};
     "#;
     let output = compile(input);
     println!("{:#?}", output);

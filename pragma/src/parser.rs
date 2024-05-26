@@ -202,6 +202,10 @@ bitflags! {
 enum Precedence {
     Lowest,
     Assign,
+    Or,
+    Xor,
+    And,
+    Compare,
     AddSub,
     MulDiv,
     Unary,
@@ -228,9 +232,9 @@ fn parse_expr_impl(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
                 let ident = extract_pattern(lhs);
                 let colon = parse_colon(lex);
                 let ty = if let Some((Ok(Token::Eq), _)) = lex.peek() {
-                    Some(parse_expr(lex, ParseUntil::Eq)).transpose()
-                } else {
                     Ok(None)
+                } else {
+                    Some(parse_expr(lex, ParseUntil::Eq)).transpose()
                 };
                 let eq = parse_eq(lex);
                 let rhs = parse_expr(lex, ParseUntil::Termination);
@@ -267,17 +271,37 @@ fn parse_expr_impl(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
             Some((Ok(Token::Plus), span)) => BinaryOp::Add.spanned(span.into()),
             Some((Ok(Token::Minus), span)) => BinaryOp::Sub.spanned(span.into()),
             Some((Ok(Token::Star), span)) => BinaryOp::Mul.spanned(span.into()),
+            Some((Ok(Token::Slash), span)) => BinaryOp::Div.spanned(span.into()),
+            Some((Ok(Token::Percent), span)) => BinaryOp::Rem.spanned(span.into()),
+            Some((Ok(Token::Ampersand), span)) => BinaryOp::And.spanned(span.into()),
+            Some((Ok(Token::Caret), span)) => BinaryOp::Xor.spanned(span.into()),
+            Some((Ok(Token::Pipe), span)) => BinaryOp::Or.spanned(span.into()),
+            Some((Ok(Token::EqEq), span)) => BinaryOp::Eq.spanned(span.into()),
+            Some((Ok(Token::NotEq), span)) => BinaryOp::Ne.spanned(span.into()),
+            Some((Ok(Token::Lt), span)) => BinaryOp::Lt.spanned(span.into()),
+            Some((Ok(Token::Le), span)) => BinaryOp::Le.spanned(span.into()),
+            Some((Ok(Token::Gt), span)) => BinaryOp::Gt.spanned(span.into()),
+            Some((Ok(Token::Ge), span)) => BinaryOp::Ge.spanned(span.into()),
             _ => break,
         };
         lex.next();
         let prec = match op.node {
             BinaryOp::Add | BinaryOp::Sub => Precedence::AddSub,
-            BinaryOp::Mul => Precedence::MulDiv,
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => Precedence::MulDiv,
+            BinaryOp::And => Precedence::And,
+            BinaryOp::Xor => Precedence::Xor,
+            BinaryOp::Or => Precedence::Or,
+            BinaryOp::Eq => Precedence::Compare,
+            BinaryOp::Ne => Precedence::Compare,
+            BinaryOp::Lt => Precedence::Compare,
+            BinaryOp::Le => Precedence::Compare,
+            BinaryOp::Gt => Precedence::Compare,
+            BinaryOp::Ge => Precedence::Compare,
         };
 
-        let mut operand = parse_primary(lex, until)?;
+        let operand = parse_primary(lex, until)?;
 
-        let mut op = Some(op);
+        let op = Some(op);
         while let Some((_, prec2, _)) = stack.last() {
             if *prec2 < prec {
                 break;
@@ -376,13 +400,15 @@ fn parse_primary(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
                 }.spanned(span)
             }
         }
-        Some((Ok(tok@(Token::Plus | Token::Minus | Token::Star | Token::Ampersand)), span)) => {
+        Some((Ok(tok@(Token::Plus | Token::Minus | Token::Star | Token::Ampersand | Token::Bang)), span)) => {
             let span = span.into();
             let op = match tok {
                 Token::Plus => UnaryOp::Pos,
                 Token::Minus => UnaryOp::Neg,
                 Token::Star => UnaryOp::Deref,
                 Token::Ampersand => UnaryOp::Ref,
+                Token::Bang => UnaryOp::Not,
+
                 _ => unreachable!(),
             }.spanned(span);
             lex.next();
@@ -461,6 +487,31 @@ fn parse_primary(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
                     rbrace,
                 }.spanned(span)
             }
+            
+            Some((Ok(Token::Dot), _)) => {
+                let dot = parse_dot(lex);
+                let field = parse_ident(lex);
+                let (dot, field) = cmrg!(dot, field).recover(lex, RecoveryTarget::Semi)?;
+                if matches!(lex.peek(), Some((Ok(Token::LParen), _))) {
+                    let (lparen, args, rparen) = parse_args(lex)?;
+                    let span = expr.span.merge(rparen.span);
+                    Expr::Method {
+                        obj: Box::new(expr),
+                        dot,
+                        method: field,
+                        lparen,
+                        args,
+                        rparen,
+                    }.spanned(span)
+                } else {
+                    let span = expr.span.merge(field.span);
+                    Expr::Field {
+                        obj: Box::new(expr),
+                        dot,
+                        field,
+                    }.spanned(span)
+                }
+            }
 
             _ => return Ok(expr),
         }
@@ -489,7 +540,7 @@ fn parse_block(lex: &mut Lex) -> Result<Ast<Expr>> {
     let stmts = vmrg!(stmts).recover(lex, RecoveryTarget::RBrace);
     let rbrace = parse_rbrace(lex);
     let (lbrace, mut stmts, rbrace) = cmrg!(lbrace, stmts, rbrace)?;
-    let ret = if !stop {
+    let ret = if stop {
         stmts.pop().map(|(s, c)| {
             assert!(c.is_none());
             Box::new(s)
@@ -544,7 +595,7 @@ fn parse_struct_decl(lex: &mut Lex) -> Result<Ast<Expr>> {
 fn parse_fn_decl(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
     let fn_kw = parse_fn(lex)?;
     let params = parse_args_decl(lex)?;
-    
+
     let ret_ty = if let Some((Ok(Token::Arrow), _)) = lex.peek() {
         let arrow = parse_arrow(lex);
         let ty = parse_primary(lex, until).recover(lex, RecoveryTarget::Semi);
@@ -553,10 +604,10 @@ fn parse_fn_decl(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
     } else {
         None
     };
-    
+
     let body = parse_expr(lex, until)?;
     let span = fn_kw.span.merge(body.span);
-    
+
     Ok(Expr::FnDecl {
         kw_fn: fn_kw,
         lparen: params.0,
@@ -603,11 +654,57 @@ fn parse_type(lex: &mut Lex) -> Result<Ast<Expr>> {
 }
 
 fn parse_if(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
-    todo!()
+    let if_kw = parse_if_kw(lex);
+    let lparen = parse_lparen(lex);
+    let cond = parse_expr(lex, ParseUntil::Termination).recover(lex, RecoveryTarget::RParen);
+    let rparen = parse_rparen(lex);
+    
+    let body = parse_primary(lex, until);
+    let (else_kw, else_) = if let Some((Ok(Token::Else), _)) = lex.peek() {
+        let else_kw = parse_else_kw(lex);
+        let else_body = parse_primary(lex, until);
+        let (else_kw, else_body) = cmrg!(else_kw, else_body).recover(lex, RecoveryTarget::Semi)?;
+        (Some(else_kw), Some(Box::new(else_body)))
+    } else {
+        (None, None)
+    };
+    
+    let (if_kw, lparen, cond, rparen, body) = cmrg!(if_kw, lparen, cond, rparen, body)
+        .recover(lex, RecoveryTarget::Semi)?;
+    
+    let mut span = if_kw.span.merge(body.span);
+    if let Some(else_) = &else_ {
+        span = span.merge(else_.span);
+    }
+    
+    Ok(Expr::If {
+        kw_if: if_kw,
+        lparen,
+        cond: Box::new(cond),
+        rparen,
+        then: Box::new(body),
+        kw_else: else_kw,
+        else_,
+    }.spanned(span))
 }
 
 fn parse_while(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
-    todo!()
+    let while_kw = parse_while_kw(lex);
+    let lparen = parse_lparen(lex);
+    let cond = parse_expr(lex, ParseUntil::Termination).recover(lex, RecoveryTarget::RParen);
+    let rparen = parse_rparen(lex);
+    let body = parse_primary(lex, until);
+    let (while_kw, lparen, cond, rparen, body) = cmrg!(while_kw, lparen, cond, rparen, body)
+        .recover(lex, RecoveryTarget::Semi)?;
+    let span = while_kw.span.merge(body.span);
+    
+    Ok(Expr::While {
+        kw_while: while_kw,
+        lparen,
+        cond: Box::new(cond),
+        rparen,
+        body: Box::new(body),
+    }.spanned(span))
 }
 
 fn parse_return(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
@@ -700,8 +797,10 @@ simple_parser!(parse_fn, KwFn: Token::Fn => KwFn, "Expected `fn`");
 simple_parser!(parse_fn_ty, KwFnTy: Token::FnTy => KwFnTy, "Expected `Fn`");
 simple_parser!(parse_return_kw, KwReturn: Token::Return => KwReturn, "Expected `return`");
 simple_parser!(parse_if_kw, KwIf: Token::If => KwIf, "Expected `if`");
+simple_parser!(parse_else_kw, KwElse: Token::Else => KwElse, "Expected `else`");
 simple_parser!(parse_while_kw, KwWhile: Token::While => KwWhile, "Expected `while`");
 simple_parser!(parse_ident, SmolStr2: Token::Ident(s) => s, "Expected identifier");
+simple_parser!(parse_dot, PunctDot: Token::Dot => PunctDot, "Expected `.`");
 
 fn maybe_parse_comma(lex: &mut Lex) -> Result<Option<Ast<PunctComma>>> {
     Ok(if let Some((Ok(Token::Comma), _)) = lex.peek() {

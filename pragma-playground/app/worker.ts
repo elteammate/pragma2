@@ -15,9 +15,10 @@ const do_compile = (code: string) => {
         const exitcode = JSCPP.run(c, "", {
           stdio: {
             write: (s: string) => out += s,
-          }
+          },
+          maxTimeout: 1000,
         })
-        out += `\n\nFinished with exit code: ${exitcode}`
+        out += `\n\nFinished with exit code: ${exitcode}\nWarning: JSCPP is not a full C++ compiler, so some code may not work as expected.`
       } catch (e: any) {
         out += e.toString()
       }
