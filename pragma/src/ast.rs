@@ -142,15 +142,15 @@ pub enum Expr {
     FnDecl {
         kw_fn: Ast<KwFn>,
         lparen: Ast<PunctLParen>,
-        args: Vec<(Ast<SmolStr2>, Ast<Expr>, Option<Ast<PunctComma>>)>,
+        args: Vec<(Ast<SmolStr2>, Ast<PunctColon>, Ast<Expr>, Option<Ast<PunctComma>>)>,
         rparen: Ast<PunctRParen>,
-        ret_ty: Option<(Ast<PunctColon>, Box<Ast<Expr>>)>,
+        ret_ty: Option<(Ast<PunctArrow>, Box<Ast<Expr>>)>,
         body: Box<Ast<Expr>>,
     },
     FnType {
         kw_fn: Ast<KwFnTy>,
         lparen: Ast<PunctLParen>,
-        args: Vec<Ast<Expr>>,
+        args: Vec<(Ast<Expr>, Option<Ast<PunctComma>>)>,
         rparen: Ast<PunctRParen>,
         arrow: Ast<PunctArrow>,
         ret: Box<Ast<Expr>>,

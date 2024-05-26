@@ -43,9 +43,32 @@ pub fn compile(input: &str) -> Result<Output, CompileError> {
 #[test]
 fn test() {
     let input = r#"
-plus_out T:type, Q:type -> type;
-plus_out [int], [int] = int;
-plus T:type, Q:type, a:T, b:T -> plus_out[T, Q];
+id T:type, b:T -> T = b;
+also_int = id[_, int];
+
+f T:type, a:T -> T;
+f [int], a:int = a;
+f [string], a:string = a;
+f T:type, a:T = a;
+g = f[int, 5];
+
+test T:type -> type;
+test [int] = string;
+test T:type = T;
+test2 T:type -> test[T];
+
+plus T:type, Q:type, a:T, b:Q -> T;
+plus [int], [int], a:int, b:int = a;
+plus [string], [string], a:string, b:string = a;
+
+six = plus[_, _, "abc", "cdb"];
+
+id [int], x:int = x;
+id [string], x:string = x;
+bcd = id[_, "abs"];
+
+a -> Fn(int) -> (Fn(int) -> int) = fn(a: int) fn(b: int) b;
+b = a(5)(6);
     "#;
     let output = compile(input);
     println!("{:#?}", output);

@@ -9,6 +9,8 @@ import ReactCodeMirror, {
 import {json} from "@codemirror/lang-json"
 import {rust} from "@codemirror/lang-rust"
 import {createRoot} from "react-dom/client"
+import {StreamLanguage} from "@codemirror/language"
+import {haskell} from "@codemirror/legacy-modes/mode/haskell"
 
 type Message = {
   from: number,
@@ -236,7 +238,7 @@ export default function Home() {
           height="100%"
           width="100%"
           theme="dark"
-          extensions={[json()]}
+          extensions={[StreamLanguage.define(haskell)]}
         />
       </div>
     </main>

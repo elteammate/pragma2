@@ -542,11 +542,45 @@ fn parse_struct_decl(lex: &mut Lex) -> Result<Ast<Expr>> {
 }
 
 fn parse_fn_decl(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
-    todo!()
+    let fn_kw = parse_fn(lex)?;
+    let params = parse_args_decl(lex)?;
+    
+    let ret_ty = if let Some((Ok(Token::Arrow), _)) = lex.peek() {
+        let arrow = parse_arrow(lex);
+        let ty = parse_primary(lex, until).recover(lex, RecoveryTarget::Semi);
+        let (arrow, ty) = cmrg!(arrow, ty).recover(lex, RecoveryTarget::Semi)?;
+        Some((arrow, Box::new(ty)))
+    } else {
+        None
+    };
+    
+    let body = parse_expr(lex, until)?;
+    let span = fn_kw.span.merge(body.span);
+    
+    Ok(Expr::FnDecl {
+        kw_fn: fn_kw,
+        lparen: params.0,
+        args: params.1,
+        rparen: params.2,
+        ret_ty,
+        body: Box::new(body),
+    }.spanned(span))
 }
 
 fn parse_fn_type(lex: &mut Lex, until: ParseUntil) -> Result<Ast<Expr>> {
-    todo!()
+    let fn_ty = parse_fn_ty(lex)?;
+    let (lparen, args, rparen) = parse_args(lex)?;
+    let arrow = parse_arrow(lex)?;
+    let ret = Box::new(parse_expr(lex, until).recover(lex, RecoveryTarget::Semi)?);
+    let span = fn_ty.span.merge(ret.span);
+    Ok(Expr::FnType {
+        kw_fn: fn_ty,
+        lparen,
+        args,
+        rparen,
+        arrow,
+        ret,
+    }.spanned(span))
 }
 
 fn parse_type(lex: &mut Lex) -> Result<Ast<Expr>> {
@@ -590,6 +624,26 @@ fn parse_args(lex: &mut Lex) -> Result<(Ast<PunctLParen>, Vec<(Ast<Expr>, Option
         let comma = maybe_parse_comma(lex);
         stop = comma.ok_and_none();
         args.push(cmrg!(arg, comma));
+        if stop { break }
+    }
+    let args = vmrg!(args).recover(lex, RecoveryTarget::RParen);
+    let rparen = parse_rparen(lex);
+    let (lparen, args, rparen) = cmrg!(lparen, args, rparen)?;
+    Ok((lparen, args, rparen))
+}
+
+fn parse_args_decl(lex: &mut Lex) -> Result<(Ast<PunctLParen>,  Vec<(Ast<SmolStr2>, Ast<PunctColon>, Ast<Expr>, Option<Ast<PunctComma>>)>, Ast<PunctRParen>)> {
+    let lparen = parse_lparen(lex);
+    let mut args = Vec::new();
+    let mut stop = false;
+    while !matches!(lex.peek(), Some((Ok(Token::RParen), _)) | None) && !stop {
+        let name = parse_ident(lex);
+        let colon = parse_colon(lex);
+        let arg = parse_expr(lex, ParseUntil::Termination)
+            .recover(lex, RecoveryTarget::Comma | RecoveryTarget::RParen);
+        let comma = maybe_parse_comma(lex);
+        stop = comma.ok_and_none();
+        args.push(cmrg!(name, colon, arg, comma));
         if stop { break }
     }
     let args = vmrg!(args).recover(lex, RecoveryTarget::RParen);

@@ -12,6 +12,7 @@ use crate::span::Span;
 #[derive(Debug, Clone)]
 pub enum Term {
     Var(SmolStr2),
+    Meta(usize),
     Undef,
     Int(i64),
     String(SmolStr2),
@@ -22,7 +23,8 @@ pub enum Term {
     StringTy,
     BoolTy,
     UnitTy,
-    Fn { args: Vec<(SmolStr2, Rc<Term>)>, body: Box<Code> },
+    Fn { args: Vec<(SmolStr2, Rc<Term>)>, body: Rc<Code> },
+    FnTy { args: Vec<(Rc<Term>)>, ret_ty: Rc<Term> },
     Call { obj: Rc<Term>, args: Vec<Rc<Term>> },
     Pi { ty: Rc<Term>, ident: SmolStr2, body: Rc<Term> },
     Lam { ty: Rc<Term>, ident: SmolStr2, body: Rc<Term> },
@@ -34,10 +36,11 @@ pub enum Term {
 #[derive(Debug, Clone)]
 pub enum Code {
     Var(SmolStr2),
-    Value(Term),
-    Call { obj: Box<Code>, name: SmolStr2, args: Vec<Code> },
-    Decl { name: SmolStr2, ty: Rc<Term>, val: Box<Code> },
-    Block { stmts: Vec<Code>, ret: Box<Code> },
+    Value(Rc<Term>),
+    Call { obj: Rc<Code>, args: Vec<Rc<Code>> },
+    Decl { name: SmolStr2, ty: Rc<Term>, val: Rc<Code> },
+    Block { stmts: Vec<Rc<Code>>, ret: Rc<Code> },
+    Typed { code: Rc<Code>, ty: Rc<Term> },
 }
 
 #[derive(Debug, Serialize)]
@@ -60,11 +63,11 @@ impl<T> ResultExt<T> for Result<T> {
             Err(errors) => Err(
                 errors.into_iter().map(|e| {
                     match e {
-                        ElaborateError::Commented(span, c) => 
+                        ElaborateError::Commented(span, c) =>
                             ElaborateError::Commented(span, format!("{}: {}", comment, c)),
-                        ElaborateError::UnificationFailed(span, c) => 
+                        ElaborateError::UnificationFailed(span, c) =>
                             ElaborateError::Commented(span, format!("{}: {}", comment, c)),
-                        ElaborateError::ArithmeticError(span, c) => 
+                        ElaborateError::ArithmeticError(span, c) =>
                             ElaborateError::Commented(span, format!("{}: {}", comment, c)),
                     }
                 }).collect()
@@ -78,9 +81,12 @@ struct Ctx {
     undef: Rc<Term>,
     anon: SmolStr2,
     anon_term: Rc<Term>,
+    unit: Rc<Term>,
+    unit_ty: Rc<Term>,
     items: IndexMap<SmolStr2, (Rc<Term>, Rc<Term>)>,
     locals: Vec<(SmolStr2, (Rc<Term>, Rc<Term>))>,
     span: Span,
+    metas: Vec<(Option<Rc<Term>>, Rc<Term>)>,
 }
 
 impl Ctx {
@@ -104,6 +110,34 @@ impl Ctx {
         self.locals.push((ident.clone(), (value, ty)));
         let result = f(self);
         self.locals.pop();
+        result
+    }
+
+    fn with_locals<T>(&mut self, decls: &[(SmolStr2, (Rc<Term>, Rc<Term>))], f: impl FnOnce(&mut Self) -> T) -> T {
+        for (ident, value) in decls {
+            self.locals.push((ident.clone(), value.clone()));
+        }
+        let result = f(self);
+        for _ in decls {
+            self.locals.pop();
+        }
+        result
+    }
+
+    fn with_local_decl<T>(&mut self, ident: SmolStr2, ty: Rc<Term>, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.with_local(ident.clone(), local(ident), ty.clone(), |ctx| {
+            f(ctx)
+        })
+    }
+
+    fn with_local_decls<T>(&mut self, decls: &[(SmolStr2, Rc<Term>)], f: impl FnOnce(&mut Self) -> T) -> T {
+        for (ident, ty) in decls {
+            self.locals.push((ident.clone(), (local(ident.clone()), ty.clone())));
+        }
+        let result = f(self);
+        for _ in decls {
+            self.locals.pop();
+        }
         result
     }
 
@@ -136,6 +170,19 @@ impl Ctx {
             unreachable!()
         }
     }
+
+    fn fresh_type_meta(&mut self) -> Rc<Term> {
+        let meta = Rc::new(Term::Meta(self.metas.len()));
+        self.metas.push((None, Rc::new(Term::Type(Vec::new()))));
+        meta
+    }
+
+    fn fresh_meta(&mut self) -> Rc<Term> {
+        let meta = Rc::new(Term::Meta(self.metas.len()));
+        let ty_meta = self.fresh_type_meta();
+        self.metas.push((None, ty_meta));
+        meta
+    }
 }
 
 fn local(name: SmolStr2) -> Rc<Term> {
@@ -150,6 +197,81 @@ fn fresh_common(ctx: &mut Ctx, a: SmolStr2, b: SmolStr2) -> SmolStr2 {
     })
 }
 
+fn type_of(ctx: &mut Ctx, term: Rc<Term>) -> Rc<Term> {
+    match &*term {
+        Term::Var(ident) => ctx.lookup(ident.clone()).expect("Ident not found").1.clone(),
+        Term::Meta(id) => ctx.metas[*id].1.clone(),
+        Term::Undef => ctx.undef.clone(),
+        Term::Int(_) => Rc::new(Term::IntTy),
+        Term::String(_) => Rc::new(Term::StringTy),
+        Term::Bool(_) => Rc::new(Term::BoolTy),
+        Term::Unit => Rc::new(Term::UnitTy),
+        Term::Type(_) => term.clone(),
+        Term::IntTy => ctx.star.clone(),
+        Term::StringTy => ctx.star.clone(),
+        Term::BoolTy => ctx.star.clone(),
+        Term::UnitTy => ctx.star.clone(),
+        Term::Call { obj, .. } => {
+            let obj_ty = type_of(ctx, obj.clone());
+            match &*obj_ty {
+                Term::FnTy { ret_ty, .. } => ret_ty.clone(),
+                _ => panic!("Calling not-function in typed code"),
+            }
+        }
+        Term::Pi { .. } => ctx.star.clone(), // TODO: maybe filter out indicators properly
+        Term::Lam { ident, ty, body } => {
+            ctx.with_local(ident.clone(), ctx.undef.clone(), ctx.undef.clone(), |ctx| {
+                let body = type_of(ctx, body.clone());
+                Rc::new(Term::Pi { ident: ident.clone(), ty: ty.clone(), body })
+            })
+        }
+        Term::FnTy { .. } => ctx.star.clone(),
+        Term::App { obj, arg } => {
+            let obj_ty = type_of(ctx, obj.clone());
+            Rc::new(Term::App {
+                obj: obj_ty.clone(),
+                arg: arg.clone(),
+            })
+        }
+        Term::Match { obj, cases, default } => {
+            let cases = cases.iter().map(|(pat, body)| {
+                ctx.with_case(obj.clone(), pat.clone(), |ctx| {
+                    let body_ty = type_of(ctx, body.clone());
+                    (pat.clone(), body_ty)
+                })
+            }).collect();
+            let default_ty = type_of(ctx, default.clone());
+            Rc::new(Term::Match { obj: obj.clone(), cases, default: default_ty.clone() })
+        }
+        Term::Fn { args, body } => {
+            let ret_ty = ctx.with_local_decls(args, |ctx| {
+                type_of_code(ctx, body.clone())
+            });
+            Rc::new(Term::FnTy { args: args.iter().map(|(_, ty)| ty).cloned().collect(), ret_ty })
+        }
+        Term::Source { term, .. } => type_of(ctx, term.clone()),
+    }
+}
+
+fn type_of_code(ctx: &mut Ctx, code: Rc<Code>) -> Rc<Term> {
+    match &*code {
+        Code::Var(ident) => ctx.lookup(ident.clone()).expect("Ident not found").1.clone(),
+        Code::Value(term) => type_of(ctx, term.clone()),
+        Code::Call { obj, .. } => {
+            let obj_ty = type_of_code(ctx, obj.clone());
+            match &*obj_ty {
+                Term::FnTy { ret_ty, .. } => ret_ty.clone(),
+                _ => panic!("Calling not-function in typed code"),
+            }
+        }
+        Code::Block { ret, .. } => {
+            type_of_code(ctx, ret.clone())
+        }
+        Code::Decl { .. } => ctx.unit_ty.clone(),
+        Code::Typed { ty, .. } => ty.clone(),
+    }
+}
+
 pub fn elaborate(module: &Module) -> Result<IndexMap<SmolStr2, (Rc<Term>, Rc<Term>)>> {
     let anon = SmolStr2::from("<anon>");
     let mut ctx = Ctx {
@@ -157,9 +279,12 @@ pub fn elaborate(module: &Module) -> Result<IndexMap<SmolStr2, (Rc<Term>, Rc<Ter
         undef: Rc::new(Term::Undef),
         anon: anon.clone(),
         anon_term: Rc::new(Term::Var(anon.clone())),
+        unit: Rc::new(Term::Unit),
+        unit_ty: Rc::new(Term::UnitTy),
         items: make_intrinsics(),
         locals: Vec::new(),
         span: Span(0, 0),
+        metas: Vec::new(),
     };
 
     for item in &module.items {
@@ -184,7 +309,7 @@ fn elaborate_item(ctx: &mut Ctx, item: &Item) -> Result<()> {
                             obj: ctx.anon_term.clone(),
                             cases: vec![(value.clone(), body)],
                             default: ctx.undef.clone(),
-                        })
+                        }),
                     }),
                     Rc::new(Term::Pi {
                         ident: ctx.anon.clone(),
@@ -196,7 +321,7 @@ fn elaborate_item(ctx: &mut Ctx, item: &Item) -> Result<()> {
                         }),
                     }),
                 )
-            },
+            }
             Some(Param::Generic { ident, ty, .. }) => {
                 let ty = check(ctx, ty, &mut ctx.star.clone())?;
                 let (body, out_ty) = if let Some(ident) = ident {
@@ -234,16 +359,25 @@ fn elaborate_item(ctx: &mut Ctx, item: &Item) -> Result<()> {
                 } else {
                     (ctx.undef.clone(), ctx.undef.clone())
                 }
-            },
+            }
         };
 
         Ok(result)
     }
 
     ctx.with_span(item.ident.span, |ctx| {
-        let (new, new_ty) = elaborate_item_impl(ctx, item, 0)?;
+        let (new, _) = elaborate_item_impl(ctx, item, 0)?;
+
         let new = nf(ctx, new)?;
+        let new_ty = type_of(ctx, new.clone());
         let new_ty = nf(ctx, new_ty)?;
+
+        if contains_metas(&new) || contains_metas(&new_ty) {
+            return err(ElaborateError::Commented(
+                ctx.span,
+                format!("The item contains unsolved metas: `{}` having type `{}`", new, new_ty),
+            ));
+        }
 
         let (existing, existing_ty) = match ctx.items.get(&item.ident.node) {
             Some((existing, existing_ty)) => (existing.clone(), existing_ty.clone()),
@@ -257,9 +391,11 @@ fn elaborate_item(ctx: &mut Ctx, item: &Item) -> Result<()> {
             .with_comment(format!("Cannot merge the existing item with this because of type mismatch: `{}` and `{}`", existing_ty, new_ty))?;
         let value1 = merge_into(ctx, existing.clone(), new.clone())
             .with_comment(format!("Cannot merge the existing item with this because of value mismatch: `{}` and `{}`", existing, new))?;
-        let (value, ty) = (value1, ty1);
+        let (value, _) = (value1, ty1);
 
         let value = nf(ctx, value)?;
+        // let ty = nf(ctx, ty)?;
+        let ty = type_of(ctx, value.clone());
         let ty = nf(ctx, ty)?;
 
         ctx.items.insert(item.ident.node.clone(), (value, ty));
@@ -277,13 +413,18 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
                     Err(_) => return err(ElaborateError::ArithmeticError(expr.span, "Integer overflow".to_string()))
                 };
                 (Term::Int(value), Term::IntTy)
-            },
+            }
             Expr::String(value) => (Term::String(value.clone()), Term::StringTy),
             Expr::Bool(value) => (Term::Bool(*value), Term::BoolTy),
             Expr::Unit => (Term::Unit, Term::UnitTy),
             Expr::PlainType { .. } => (Term::Type(Vec::new()), Term::Type(Vec::new())),
             Expr::Ident(ident) => return ctx.lookup_ident(&ident.clone().spanned(expr.span)),
             Expr::Paren { expr, .. } => return infer(ctx, expr),
+            Expr::Hole => {
+                let meta = ctx.fresh_meta();
+                return Ok((meta.clone(), type_of(ctx, meta)));
+            }
+            Expr::Uninit => (Term::Undef, Term::Undef),
 
             Expr::App { callee, params, .. } => {
                 let (mut callee, mut callee_ty) = infer(ctx, callee)?;
@@ -310,14 +451,89 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
                         Rc::new(Term::App { obj: callee_ty, arg: param }),
                     )
                 }
-                return Ok((callee, callee_ty))
+                return Ok((callee, callee_ty));
             }
-            
+
+            Expr::FnDecl { body, args, ret_ty, .. } => {
+                let args = args.iter().map(|(ident, _, ty, _)| {
+                    let ty = check(ctx, ty, &mut ctx.star.clone())?;
+                    Ok((ident.node.clone(), ty))
+                }).collect::<Result<Vec<_>>>()?;
+
+                let (body, inferred_ret) = ctx.with_local_decls(&args, |ctx| {
+                    infer_code(ctx, body)
+                });
+
+                if let Some((_, ret_ty)) = ret_ty {
+                    let ret_ty = check(ctx, ret_ty, &mut ctx.star.clone())?;
+                    unify(ctx, inferred_ret.clone(), ret_ty.clone())?;
+                }
+
+                (
+                    Term::Fn {
+                        args: args.clone(),
+                        body,
+                    },
+                    Term::FnTy {
+                        args: args.iter().map(|(_, ty)| ty.clone()).collect(),
+                        ret_ty: inferred_ret,
+                    },
+                )
+            }
+
+            Expr::Call { callee, args, .. } => {
+                let (callee, callee_ty) = infer(ctx, callee)?;
+                return match &*callee_ty {
+                    Term::FnTy { args: expected_args, ret_ty } => {
+                        if args.len() != expected_args.len() {
+                            return err(ElaborateError::Commented(
+                                ctx.span,
+                                format!("Expected {} arguments, got {}", expected_args.len(), args.len()),
+                            ));
+                        }
+                        let args = args.iter().zip(expected_args).map(|(arg, ty)| {
+                            check(ctx, &arg.0, &mut ty.clone())
+                        }).collect::<Result<Vec<_>>>()?;
+                        Ok((Rc::new(Term::Call { obj: callee, args }), ret_ty.clone()))
+                    }
+                    _ => err(ElaborateError::Commented(
+                        ctx.span,
+                        format!("Expected a function, got `{}`", callee_ty),
+                    )),
+                };
+            }
+
+            Expr::FnType { args, ret, .. } => {
+                let args = args.iter().map(|(ty, _)| {
+                    let ty = check(ctx, ty, &mut ctx.star.clone())?;
+                    Ok(ty)
+                }).collect::<Result<Vec<_>>>()?;
+
+                let ret_ty = check(ctx, ret, &mut ctx.star.clone())?;
+
+                return Ok((
+                    Rc::new(Term::FnTy {
+                        args,
+                        ret_ty,
+                    }),
+                    ctx.star.clone(),
+                ));
+            }
+
             _ => todo!("Can't infer type of expression yet {:#?}", expr.node),
         };
 
         Ok((Rc::new(val), Rc::new(ty)))
     })
+}
+
+fn infer_code(ctx: &mut Ctx, expr: &Ast<Expr>) -> (Rc<Code>, Rc<Term>) {
+    match &expr.node {
+        _ => {
+            let (value, inferred) = infer(ctx, expr).unwrap();
+            (Rc::new(Code::Value(value)), inferred)
+        }
+    }
 }
 
 
@@ -346,6 +562,26 @@ fn unify(ctx: &mut Ctx, a: Rc<Term>, b: Rc<Term>) -> Result<Rc<Term>> {
     let result = match (&*a, &*b) {
         (_, Undef) => return Ok(a.clone()),
         (Undef, _) => return Ok(b.clone()),
+        (Meta(id), _) => {
+            let a_ty = type_of(ctx, a.clone());
+            let b_ty = type_of(ctx, b.clone());
+            unify(ctx, a_ty, b_ty.clone())?;
+            if let Some(value) = &ctx.metas[*id].0 {
+                return unify(ctx, value.clone(), b);
+            }
+            ctx.metas[*id] = (Some(b.clone()), b_ty);
+            return Ok(b);
+        }
+        (_, Meta(id)) => {
+            let a_ty = type_of(ctx, a.clone());
+            let b_ty = type_of(ctx, b.clone());
+            unify(ctx, a_ty.clone(), b_ty)?;
+            if let Some(value) = &ctx.metas[*id].0 {
+                return unify(ctx, a, value.clone());
+            }
+            ctx.metas[*id] = (Some(a.clone()), a_ty);
+            return Ok(a);
+        }
         (UnitTy, UnitTy) => UnitTy,
         (IntTy, IntTy) => IntTy,
         (StringTy, StringTy) => StringTy,
@@ -363,7 +599,7 @@ fn unify(ctx: &mut Ctx, a: Rc<Term>, b: Rc<Term>) -> Result<Rc<Term>> {
             let result = Type(Vec::new());
             assert!(xs.is_empty() && ys.is_empty(), "TODO: Unify type parameters");
             result
-        },
+        }
 
         (Pi { ident: ident1, ty: ty1, body: body1 }, Pi { ident: ident2, ty: ty2, body: body2 }) => {
             let ident = fresh_common(ctx, ident1.clone(), ident2.clone());
@@ -374,7 +610,7 @@ fn unify(ctx: &mut Ctx, a: Rc<Term>, b: Rc<Term>) -> Result<Rc<Term>> {
             let body = unify(ctx, body1, body2)?;
 
             Pi { ident, ty, body }
-        },
+        }
 
         (
             Match { obj: obj1, cases: cases1, default: default1 },
@@ -453,7 +689,7 @@ fn unify(ctx: &mut Ctx, a: Rc<Term>, b: Rc<Term>) -> Result<Rc<Term>> {
                     let body = unify(ctx, body.clone(), ctx.undef.clone())?;
                     Ok((pat, body))
                 }).collect::<Result<_>>()?,
-                default: unify(ctx, a, default.clone())?
+                default: unify(ctx, a, default.clone())?,
             }
         }
 
@@ -465,10 +701,30 @@ fn unify(ctx: &mut Ctx, a: Rc<Term>, b: Rc<Term>) -> Result<Rc<Term>> {
                     let body = unify(ctx, body.clone(), ctx.undef.clone())?;
                     Ok((pat, body))
                 }).collect::<Result<_>>()?,
-                default: unify(ctx, default.clone(), b)?
+                default: unify(ctx, default.clone(), b)?,
             }
         }
-        
+
+        (
+            FnTy { args: args1, ret_ty: ret1, .. },
+            FnTy { args: args2, ret_ty: ret2, .. },
+        ) => {
+            if args1.len() != args2.len() {
+                return err(ElaborateError::UnificationFailed(
+                    ctx.span,
+                    format!("Cannot unify functions with different number of arguments: `{}` and `{}`", a, b),
+                ));
+            }
+            
+            let args = args1.iter().zip(args2).map(|(arg1, arg2)| {
+                unify(ctx, arg1.clone(), arg2.clone())
+            }).collect::<Result<Vec<_>>>()?;
+            
+            let ret = unify(ctx, ret1.clone(), ret2.clone())?;
+            
+            FnTy { args, ret_ty: ret }
+        }
+
         _ => return err(ElaborateError::UnificationFailed(
             ctx.span,
             format!("Cannot unify `{}` and `{}`", a, b)),
@@ -548,7 +804,7 @@ fn merge_into(ctx: &mut Ctx, term: Rc<Term>, add: Rc<Term>) -> Result<Rc<Term>> 
                         })?;
                         if found {
                             cases2.remove(i);
-                            break
+                            break;
                         }
                     }
                 }
@@ -617,6 +873,7 @@ fn merge_into(ctx: &mut Ctx, term: Rc<Term>, add: Rc<Term>) -> Result<Rc<Term>> 
 fn is_concrete(term: &Rc<Term>) -> bool {
     match &**term {
         Term::Var(_) => false,
+        Term::Meta(_) => false,
         Term::Undef => true,
         Term::Int(_) => true,
         Term::String(_) => true,
@@ -627,13 +884,59 @@ fn is_concrete(term: &Rc<Term>) -> bool {
         Term::StringTy => true,
         Term::BoolTy => true,
         Term::UnitTy => true,
-        Term::Fn { .. } => false,
-        Term::Call { .. } => false,
+        Term::Fn { .. } => todo!(),
+        Term::Call { .. } => todo!(),
+        Term::FnTy { .. } => todo!(),
+        Term::Source { term, .. } => is_concrete(term),
         Term::Pi { body, ty, .. } => is_concrete(body) && is_concrete(ty),
         Term::Lam { body, ty, .. } => is_concrete(body) && is_concrete(ty),
         Term::App { obj, arg } => is_concrete(obj) && is_concrete(arg),
         Term::Match { .. } => false,
-        Term::Source { term, .. } => is_concrete(term),
+    }
+}
+
+fn contains_metas(term: &Rc<Term>) -> bool {
+    match &**term {
+        Term::Var(_) => false,
+        Term::Meta(_) => true,
+        Term::Undef => false,
+        Term::Int(_) => false,
+        Term::String(_) => false,
+        Term::Bool(_) => false,
+        Term::Unit => false,
+        Term::Type(indicators) => indicators.iter().any(contains_metas),
+        Term::IntTy => false,
+        Term::StringTy => false,
+        Term::BoolTy => false,
+        Term::UnitTy => false,
+        Term::Fn { body, args } =>
+            code_contains_metas(body) ||
+                args.iter().any(|(_, ty)| contains_metas(ty)),
+        Term::FnTy { args, ret_ty } =>
+            args.iter().any(contains_metas) ||
+                contains_metas(ret_ty),
+        Term::Call { obj, args } =>
+            contains_metas(obj) ||
+                args.iter().any(contains_metas),
+        Term::Pi { body, ty, .. } => contains_metas(body) || contains_metas(ty),
+        Term::Lam { body, ty, .. } => contains_metas(body) || contains_metas(ty),
+        Term::App { obj, arg } => contains_metas(obj) || contains_metas(arg),
+        Term::Match { obj, cases, default } =>
+            contains_metas(obj) ||
+                cases.iter().any(|(pat, body)| contains_metas(pat) || contains_metas(body)) ||
+                contains_metas(default),
+        Term::Source { term, .. } => contains_metas(term),
+    }
+}
+
+fn code_contains_metas(code: &Rc<Code>) -> bool {
+    match &**code {
+        Code::Var(_) => false,
+        Code::Value(term) => contains_metas(term),
+        Code::Call { obj, args } => code_contains_metas(obj) || args.iter().any(|arg| code_contains_metas(arg)),
+        Code::Block { ret, stmts } => code_contains_metas(ret) || stmts.iter().any(code_contains_metas),
+        Code::Decl { ty, val, .. } => contains_metas(ty) || code_contains_metas(val),
+        Code::Typed { code, .. } => code_contains_metas(code),
     }
 }
 
@@ -647,6 +950,13 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
                     }
                 }
                 nf(ctx, value)
+            } else {
+                Ok(term)
+            }
+        }
+        Term::Meta(id) => {
+            if let Some(value) = &ctx.metas[*id].0 {
+                nf(ctx, value.clone())
             } else {
                 Ok(term)
             }
@@ -698,11 +1008,7 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
                         Ok(result)
                     }
                 }
-                Term::Match {
-                    obj: obj2,
-                    cases,
-                    default
-                } => {
+                Term::Match { cases, default, .. } => {
                     let cases = cases.iter().map(|(pat, body)| {
                         ctx.with_case(obj.clone(), pat.clone(), |ctx| {
                             Ok((pat.clone(), nf(ctx, Rc::new(Term::App {
@@ -750,6 +1056,22 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
         Term::Source { term, span } => {
             ctx.with_span(*span, |ctx| nf(ctx, term.clone()))
         }
+        Term::Call { obj, args } => {
+            let obj = nf(ctx, obj.clone())?;
+            let args = args.iter().map(|arg| nf(ctx, arg.clone())).collect::<Result<Vec<_>>>()?;
+            match &*obj {
+                Term::Fn { args: args_decl, body } => {
+                    let locals = args.iter().zip(args_decl)
+                        .map(|(val, (ident, ty))| {
+                            (ident.clone(), (val.clone(), ty.clone()))
+                        }).collect::<Vec<_>>();
+                    ctx.with_locals(&locals, |ctx| {
+                        eval_code(ctx, body.clone())
+                    })
+                }
+                _ => Ok(term),
+            }
+        }
         _ => Ok(term),
     }
 }
@@ -774,7 +1096,7 @@ fn substitute(ctx: &mut Ctx, term: Rc<Term>, name: SmolStr2, subs: Rc<Term>) -> 
                     Rc::new(Term::Lam { ident: ident.clone(), ty, body })
                 })
             }
-        },
+        }
         Term::Pi { ident, ty, body } if ident != &name => {
             if free_vars(ctx, subs.clone()).contains(ident) {
                 let new_name = ctx.fresh(ident.clone());
@@ -792,22 +1114,22 @@ fn substitute(ctx: &mut Ctx, term: Rc<Term>, name: SmolStr2, subs: Rc<Term>) -> 
                     Rc::new(Term::Pi { ident: ident.clone(), ty, body })
                 })
             }
-        },
+        }
         Term::App { obj, arg } => {
             let obj = substitute(ctx, obj.clone(), name.clone(), subs.clone());
             let arg = substitute(ctx, arg.clone(), name, subs);
             Rc::new(Term::App { obj, arg })
-        },
+        }
         Term::Match { obj, cases, default } => {
-           let obj = substitute(ctx, obj.clone(), name.clone(), subs.clone());
-           let cases = cases.iter().map(|(pat, body)| {
-               let pat = substitute(ctx, pat.clone(), name.clone(), subs.clone());
-               let body = substitute(ctx, body.clone(), name.clone(), subs.clone());
-               (pat, body)
-           }).collect::<Vec<_>>();
-           let default = substitute(ctx, default.clone(), name, subs.clone());
-           Rc::new(Term::Match { obj, cases, default })
-        },
+            let obj = substitute(ctx, obj.clone(), name.clone(), subs.clone());
+            let cases = cases.iter().map(|(pat, body)| {
+                let pat = substitute(ctx, pat.clone(), name.clone(), subs.clone());
+                let body = substitute(ctx, body.clone(), name.clone(), subs.clone());
+                (pat, body)
+            }).collect::<Vec<_>>();
+            let default = substitute(ctx, default.clone(), name, subs.clone());
+            Rc::new(Term::Match { obj, cases, default })
+        }
         _ => term,
     }
 }
@@ -819,17 +1141,17 @@ fn free_vars(ctx: &mut Ctx, term: Rc<Term>) -> Vec<SmolStr2> {
             let mut free = free_vars(ctx, body.clone());
             free.retain(|x| x != ident);
             free
-        },
+        }
         Term::Pi { ident, body, .. } => {
             let mut free = free_vars(ctx, body.clone());
             free.retain(|x| x != ident);
             free
-        },
+        }
         Term::App { obj, arg } => {
             let mut free = free_vars(ctx, obj.clone());
             free.append(&mut free_vars(ctx, arg.clone()));
             free
-        },
+        }
         Term::Match { obj, cases, default } => {
             let mut free = free_vars(ctx, obj.clone());
             for (pat, body) in cases {
@@ -855,6 +1177,7 @@ impl Display for Term {
         let indent = INDENT.with(|i| *i.borrow());
         match self {
             Term::Var(name) => write!(f, "{}", &name[..]),
+            Term::Meta(id) => write!(f, "'{}", id),
             Term::Undef => write!(f, "---"),
             Term::Int(x) => write!(f, "{}", x),
             Term::String(s) => write!(f, "\"{}\"", &s[..]),
@@ -871,9 +1194,16 @@ impl Display for Term {
             Term::BoolTy => write!(f, "bool"),
             Term::UnitTy => write!(f, "unit"),
             Term::Fn { .. } => write!(f, "<function>"),
-            Term::Call { obj, args} => {
+            Term::FnTy { args, ret_ty } => {
+                write!(f, "Fn(")?;
+                for ty in args {
+                    write!(f, "{},", ty)?;
+                }
+                write!(f, ") -> {}", ret_ty)
+            }
+            Term::Call { obj, args } => {
                 let args = args.iter().map(|i| format!("{}", i)).collect::<Vec<_>>();
-                write!(f, "{}[{}]", obj, args.join(", "))
+                write!(f, "{}({})", obj, args.join(", "))
             }
             Term::Pi { ident, body, ty } => {
                 write!(f, "∀{}: {}. {}", &ident[..], ty, body)
@@ -896,5 +1226,24 @@ impl Display for Term {
             }
             Term::Source { term, .. } => write!(f, "{}", term),
         }
+    }
+}
+
+fn eval_code(ctx: &mut Ctx, code: Rc<Code>) -> Result<Rc<Term>> {
+    match &*code {
+        Code::Value(val) => nf(ctx, val.clone()),
+
+        Code::Var(ident) => {
+            if let Some((value, _)) = ctx.lookup(ident.clone()) {
+                nf(ctx, value)
+            } else {
+                err(ElaborateError::Commented(
+                    ctx.span,
+                    format!("Variable `{}` not found upon evaluation", &ident[..]),
+                ))
+            }
+        }
+
+        _ => todo!("cannot evaluate code yet {:#?}", code),
     }
 }
