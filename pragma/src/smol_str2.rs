@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::ops::Deref;
 use serde::Serialize;
 use smol_str::SmolStr;
@@ -38,5 +38,17 @@ impl Deref for SmolStr2 {
 impl Debug for SmolStr2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(&self.0, f)
+    }
+}
+
+impl Display for SmolStr2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl From<&SmolStr2> for String {
+    fn from(s: &SmolStr2) -> Self {
+        s.0[..].into()
     }
 }

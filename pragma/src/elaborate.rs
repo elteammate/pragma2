@@ -1,15 +1,16 @@
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::rc::Rc;
 use indexmap::IndexMap;
 use serde::Serialize;
 use crate::ast::{Ast, BinaryOp, Expr, Item, Module, NodeExt, Param};
-use crate::cmrg;
+use crate::{c, cmrg};
 use crate::compound_result::{CompoundResult, err};
 use crate::intrinsics::{Intrinsic, make_intrinsics};
 use crate::smol_str2::SmolStr2;
 use crate::span::Span;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Term {
     Var(SmolStr2),
     Meta(usize),
@@ -23,9 +24,9 @@ pub enum Term {
     StringTy,
     BoolTy,
     UnitTy,
-    Intrinsic(Box<dyn Intrinsic>),
+    Intrinsic(&'static dyn Intrinsic),
     Fn { args: Vec<(SmolStr2, Rc<Term>)>, body: Rc<Term> },
-    FnTy { args: Vec<(Rc<Term>)>, ret_ty: Rc<Term> },
+    FnTy { args: Vec<Rc<Term>>, ret_ty: Rc<Term> },
     Call { obj: Rc<Term>, args: Vec<Rc<Term>> },
     Pi { ty: Rc<Term>, ident: SmolStr2, body: Rc<Term> },
     Lam { ty: Rc<Term>, ident: SmolStr2, body: Rc<Term> },
@@ -70,14 +71,14 @@ impl<T> ResultExt<T> for Result<T> {
     }
 }
 
-struct Ctx {
+pub struct Ctx {
     star: Rc<Term>,
     undef: Rc<Term>,
     anon: SmolStr2,
     anon_term: Rc<Term>,
     unit: Rc<Term>,
     unit_ty: Rc<Term>,
-    items: IndexMap<SmolStr2, (Rc<Term>, Rc<Term>)>,
+    pub items: IndexMap<SmolStr2, (Rc<Term>, Rc<Term>)>,
     locals: Vec<(SmolStr2, (Rc<Term>, Rc<Term>))>,
     span: Span,
     metas: Vec<(Option<Rc<Term>>, Rc<Term>)>,
@@ -254,7 +255,7 @@ fn type_of(ctx: &mut Ctx, term: Rc<Term>) -> Rc<Term> {
     }
 }
 
-pub fn elaborate(module: &Module) -> Result<IndexMap<SmolStr2, (Rc<Term>, Rc<Term>)>> {
+pub fn elaborate(module: &Module) -> Result<Ctx> {
     let anon = SmolStr2::from("<anon>");
     let mut ctx = Ctx {
         star: Rc::new(Term::Type(Vec::new())),
@@ -273,7 +274,7 @@ pub fn elaborate(module: &Module) -> Result<IndexMap<SmolStr2, (Rc<Term>, Rc<Ter
         elaborate_item(&mut ctx, &item.node)?;
     }
 
-    Ok(ctx.items)
+    Ok(ctx)
 }
 
 fn elaborate_item(ctx: &mut Ctx, item: &Item) -> Result<()> {
@@ -1071,7 +1072,11 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
                     })
                 }
                 Term::Intrinsic(intrinsic) => {
-                    intrinsic.call(args)
+                    if intrinsic.can_call() && args.iter().all(is_concrete) {
+                        intrinsic.call(args)
+                    } else {
+                        Ok(term)
+                    }
                 }
                 Term::Match { obj, cases, default } => {
                     let cases = cases.iter().map(|(pat, body)| {
@@ -1090,6 +1095,24 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
                 }
                 _ => Ok(term),
             }
+        }
+        Term::Fn { args, body } => {
+            let args = args.iter().map(|(ident, ty)| {
+                let ty = nf(ctx, ty.clone())?;
+                Ok((ident.clone(), ty))
+            }).collect::<Result<Vec<_>>>()?;
+            let body = ctx.with_local_decls(&args, |ctx| nf(ctx, body.clone()))?;
+            Ok(Rc::new(Term::Fn { args, body }))
+        }
+        Term::FnTy { args, ret_ty } => {
+            let args = args.iter().map(|ty| nf(ctx, ty.clone())).collect::<Result<Vec<_>>>()?;
+            let ret_ty = nf(ctx, ret_ty.clone())?;
+            Ok(Rc::new(Term::FnTy { args, ret_ty }))
+        }
+        Term::Decl { val, ty, name } => {
+            let val = nf(ctx, val.clone())?;
+            let ty = nf(ctx, ty.clone())?;
+            Ok(Rc::new(Term::Decl { val, ty, name: name.clone() }))
         }
         _ => Ok(term),
     }
@@ -1149,6 +1172,35 @@ fn substitute(ctx: &mut Ctx, term: Rc<Term>, name: SmolStr2, subs: Rc<Term>) -> 
             let default = substitute(ctx, default.clone(), name, subs.clone());
             Rc::new(Term::Match { obj, cases, default })
         }
+        Term::Fn { args, body } => {
+            let args = args.iter().map(|(ident, ty)| {
+                let ty = substitute(ctx, ty.clone(), name.clone(), subs.clone());
+                (ident.clone(), ty)
+            }).collect::<Vec<_>>();
+            if args.iter().any(|(ident, _)| ident == &name) {
+                Rc::new(Term::Fn { args, body: body.clone() })
+            } else {
+                let body = substitute(ctx, body.clone(), name, subs);
+                Rc::new(Term::Fn { args, body })
+            }
+        }
+        Term::FnTy { args, ret_ty } => {
+            let args = args.iter().map(|ty| substitute(ctx, ty.clone(), name.clone(), subs.clone())).collect();
+            let ret_ty = substitute(ctx, ret_ty.clone(), name, subs);
+            Rc::new(Term::FnTy { args, ret_ty })
+        }
+        Term::Call { obj, args } => {
+            let obj = substitute(ctx, obj.clone(), name.clone(), subs.clone());
+            let args = args.iter().map(|arg| substitute(ctx, arg.clone(), name.clone(), subs.clone())).collect();
+            Rc::new(Term::Call { obj, args })
+        }
+        Term::Source { term, .. } => substitute(ctx, term.clone(), name, subs),
+        Term::Decl { val, ty, name: ident } => {
+            let val = substitute(ctx, val.clone(), name.clone(), subs.clone());
+            let ty = substitute(ctx, ty.clone(), name, subs);
+            Rc::new(Term::Decl { name: ident.clone(), val, ty })
+        }
+        Term::Block { .. } => todo!(),
         _ => term,
     }
 }
@@ -1257,6 +1309,290 @@ impl Display for Term {
             }
             Term::Typed { term, ty } => write!(f, "({})::{}", term, ty),
             Term::Intrinsic(intrinsic) => write!(f, "<{}>", &intrinsic.name()[..]),
+        }
+    }
+}
+
+struct Builder {
+    includes: Vec<SmolStr2>,
+    structs: Vec<c::Struct>,
+    functions: Vec<c::Function>,
+    externals: Vec<c::ExternalFunction>,
+    added_externals: HashMap<SmolStr2, usize>,
+    function_cache: Vec<(Rc<Term>, usize)>,
+}
+
+struct FnBuilder {
+    locals: Vec<c::CType>,
+}
+
+struct BlockBuilder<'a> {
+    previous: Option<&'a mut BlockBuilder<'a>>,
+    locals: HashMap<SmolStr2, usize>,
+    statements: Vec<c::Statement>,
+}
+
+pub struct Extraction<'a, 'b> {
+    pub ctx: &'a mut Ctx,
+    pub b: &'a mut Builder,
+    pub fb: &'a mut FnBuilder,
+    pub bb: &'a mut BlockBuilder<'b>,
+}
+
+impl<'a, 'b> Extraction<'a, 'b> {
+    fn lookup_local(&self, name: &SmolStr2) -> Option<usize> {
+        let mut bb = &self.bb;
+        loop {
+            if let Some(id) = bb.locals.get(name) {
+                return Some(*id);
+            }
+            if let Some(previous) = &bb.previous {
+                bb = previous;
+            } else {
+                return None;
+            }
+        }
+    }
+    
+    pub fn add_external(&mut self, name: SmolStr2, init: impl FnOnce() -> (Vec<SmolStr2>, c::ExternalFunction)) -> usize {
+        if let Some(id) = self.b.added_externals.get(&name) {
+            *id
+        } else {
+            let (includes, external) = init();
+            let id = self.b.externals.len();
+            self.b.externals.push(external);
+            self.b.added_externals.insert(name, id);
+            for include in includes {
+                if !self.b.includes.contains(&include) {
+                    self.b.includes.push(include);
+                }
+            }
+            
+            id
+        }
+    }
+}
+
+pub fn extract_c(ctx: &mut Ctx) -> Result<c::Module> {
+    let mut b = Builder {
+        includes: vec![],
+        structs: vec![],
+        functions: vec![],
+        externals: vec![],
+        function_cache: vec![],
+        added_externals: HashMap::new(),
+    };
+
+    let main = ctx.lookup("main".into()).ok_or_else(||
+        vec![ElaborateError::Commented(
+            ctx.span,
+            "No main function found".into(),
+        )]
+    )?.0;
+
+    let main_id = extract_fn(ctx, &mut b, main)?;
+
+    Ok(c::Module {
+        includes: b.includes,
+        structs: b.structs,
+        functions: b.functions,
+        externals: b.externals,
+        main: Some(main_id),
+    })
+}
+
+fn extract_fn(ctx: &mut Ctx, b: &mut Builder, term: Rc<Term>) -> Result<usize> {
+    let id = b.function_cache.iter().position(|(t, _)| **t == *term);
+    if let Some(id) = id {
+        return Ok(id);
+    }
+
+    let ty = type_of(ctx, term.clone());
+    
+    let Term::FnTy { ret_ty, .. } = &*ty else {
+        return err(ElaborateError::Commented(
+            ctx.span,
+            format!("Expected function type, found `{}`", ty),
+        ));
+    };
+
+    let id = b.functions.len();
+
+    b.function_cache.push((term.clone(), id));
+
+    let return_type = extract_c_type(ctx, b, &ret_ty)?;
+    let zero_sized_return = return_type.is_none();
+    let return_type = return_type.unwrap_or(c::CType::Void);
+
+    let Term::Fn { args, body } = &*term else {
+        return err(ElaborateError::Commented(
+            ctx.span,
+            format!("Expected function, found `{}`", term),
+        ));
+    };
+
+    let locals = args.iter()
+        .flat_map(|(_, ty)| extract_c_type(ctx, b, ty).transpose())
+        .collect::<Result<Vec<_>>>()?;
+    
+    let parameters = (0..locals.len()).collect();
+
+    b.functions.push(c::Function {
+        parameters,
+        body: vec![],
+        locals: vec![],
+        return_type,
+    });
+
+    let mut fb = FnBuilder {
+        locals,
+    };
+
+    let mut bb = BlockBuilder {
+        previous: None,
+        locals: HashMap::new(),
+        statements: vec![],
+    };
+
+    let expr = extract_c_expr(&mut Extraction {
+        ctx,
+        b,
+        fb: &mut fb,
+        bb: &mut bb,
+    }, body.clone())?;
+
+    if let Some(expr) = expr {
+        if !zero_sized_return {
+            bb.statements.push(c::Statement::Return(expr));
+        } else {
+            bb.statements.push(c::Statement::Expression(expr));
+        }
+    }
+
+    b.functions[id].body = bb.statements;
+    b.functions[id].locals = fb.locals;
+
+    Ok(id)
+}
+
+fn extract_c_type(ctx: &mut Ctx, b: &mut Builder, term: &Term) -> Result<Option<c::CType>> {
+    Ok(match term {
+        Term::Undef => return err(ElaborateError::Commented(
+            ctx.span,
+            "Cannot extract C type from undefined term".into(),
+        )),
+        Term::Type(_) => None,
+        Term::IntTy => Some(c::CType::Int),
+        Term::StringTy => Some(c::CType::Pointer(Box::new(c::CType::Char))),
+        Term::BoolTy => Some(c::CType::Int),
+        Term::UnitTy => None,
+        Term::Intrinsic(_) => None,
+        Term::Source { term, .. } => return extract_c_type(ctx, b, term),
+        Term::Decl { .. } => None,
+        Term::Block { ret, .. } => return extract_c_type(ctx, b, ret),
+        Term::Typed { term, .. } => return extract_c_type(ctx, b, term),
+        _ => return err(ElaborateError::Commented(
+            ctx.span,
+            format!("Cannot extract C type from term `{}`", term),
+        )),
+    })
+}
+
+fn extract_c_expr(e: &mut Extraction, term: Rc<Term>) -> Result<Option<c::Expr>> {
+    match &*term {
+        Term::Var(name) => {
+            if let Some(local) = e.lookup_local(name) {
+                Ok(Some(c::Expr::Local {
+                    id: local,
+                }))
+            } else {
+                err(ElaborateError::Commented(
+                    e.ctx.span,
+                    format!("Unknown variable `{}` (if it is global, it must be normalized away)", name),
+                ))
+            }
+
+        }
+        Term::Meta(_) => err(ElaborateError::Commented(
+            e.ctx.span,
+            "Unsolved meta variables found upon C extraction (THIS IS ICE!)".into(),
+        )),
+        Term::Undef => Ok(None),
+        Term::Int(x) => Ok(Some(c::Expr::Int { x: *x })),
+        Term::String(s) => Ok(Some(c::Expr::String { s: s.into() })),
+        Term::Bool(x) => Ok(Some(c::Expr::Int { x: if *x { 1 } else { 0 } })),
+        Term::Unit => Ok(None),
+        Term::Type(_) | Term::IntTy | Term::StringTy | Term::BoolTy
+        | Term::UnitTy | Term::FnTy { .. }
+            => err(ElaborateError::Commented(
+                e.ctx.span,
+                format!("Cannot extract C expression from type `{}`", term),
+            )),
+        Term::Intrinsic(_) | Term::Fn { .. } => err(ElaborateError::Commented(
+            e.ctx.span,
+            format!("Cannot extract C expression from non-called function `{}`", term),
+        )),
+        Term::Pi { .. } | Term::Lam { .. } | Term::App { .. } | Term::Match { .. } =>
+            err(ElaborateError::Commented(
+                e.ctx.span,
+                format!("Cannot extract C expression from non-normalized meta-langauge item `{}`", term),
+            )),
+        Term::Source { term, .. } => {
+            extract_c_expr(e, term.clone())
+        },
+        Term::Typed { term, .. } => {
+            extract_c_expr(e, term.clone())
+        },
+
+        Term::Call { obj, args } => {
+            let args = args.iter().map(|arg|
+                extract_c_expr(e, arg.clone())
+            ).collect::<Result<Vec<_>>>()?;
+
+            match &**obj {
+                Term::Intrinsic(intrinsic) => {
+                    if !intrinsic.can_emit() {
+                        return err(ElaborateError::Commented(
+                            e.ctx.span,
+                            format!("Cannot extract C expression from intrinsic `{}`", obj),
+                        ));
+                    }
+
+                    let (stmts, expr) = intrinsic.emit(
+                        e,
+                        args.into_iter().flatten().collect()
+                    );
+
+                    for stmt in stmts {
+                        e.bb.statements.push(stmt);
+                    }
+
+                    Ok(expr)
+                }
+
+                Term::Fn { .. } => {
+                    let function_id = extract_fn(e.ctx, e.b, obj.clone())?;
+
+                    Ok(Some(c::Expr::Call {
+                        f: Box::new(c::Expr::Global {
+                            id: function_id,
+                        }),
+                        args: args.into_iter().flatten().collect(),
+                    }))
+                }
+
+                _ => err(ElaborateError::Commented(
+                    e.ctx.span,
+                    format!("Cannot extract C expression from non-function `{}`", obj),
+                )),
+            }
+        },
+
+        Term::Decl { ty, val, name } => {
+            todo!("variables are not yet implemented")
+        }
+        Term::Block { .. } => {
+            todo!("blocks are not yet implemented")
         }
     }
 }

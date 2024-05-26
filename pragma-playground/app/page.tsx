@@ -11,6 +11,7 @@ import {rust} from "@codemirror/lang-rust"
 import {createRoot} from "react-dom/client"
 import {StreamLanguage} from "@codemirror/language"
 import {haskell} from "@codemirror/legacy-modes/mode/haskell"
+import {cpp} from "@codemirror/lang-cpp"
 
 type Message = {
   from: number,
@@ -30,12 +31,12 @@ const errorsField = StateField.define({
     underlines = underlines.map(tr.changes)
     for (let e of tr.effects) if (e.is(addError)) {
       underlines = underlines.update({
-        add: [errorMark.range(e.value.from, e.value.to)]
+        add: [errorMark.range(e.value.from, e.value.to)],
       })
     }
     return underlines
   },
-  provide: f => EditorView.decorations.from(f)
+  provide: f => EditorView.decorations.from(f),
 })
 
 const messagesField: StateField<Message[]> = StateField.define({
@@ -48,7 +49,7 @@ const messagesField: StateField<Message[]> = StateField.define({
       messages.push(e.value)
     }
     return messages
-  }
+  },
 })
 
 const errorHover = hoverTooltip((view, pos) => {
@@ -56,7 +57,7 @@ const errorHover = hoverTooltip((view, pos) => {
 
   const messages = view.state.field(messagesField, false) ?? []
 
-  for (let i = 0; i < messages.length; i++){
+  for (let i = 0; i < messages.length; i++) {
     const m = messages[i]
     if (m.from <= pos && pos < m.to) {
       let text = m.message
@@ -87,7 +88,7 @@ const errorHover = hoverTooltip((view, pos) => {
     above: true,
     create() {
       return {dom: element}
-    }
+    },
   }
 }, {
   hoverTime: 1,
@@ -150,7 +151,7 @@ export default function Home() {
   const underlineTheme = useMemo(() => EditorView.baseTheme({
     ".cm-error": {
       textDecoration: "underline 2px red",
-    }
+    },
   }), [])
 
   const out = output as any
@@ -203,22 +204,24 @@ export default function Home() {
   }, [refs.current, output])
 
   let result
+  let ok = false
   if (!ready) {
-    result = "..."
+    result = ["..."]
   } else if (out.Ok) {
-    result = out.Ok.ctx;
+    result = [out.Ok.ctx, out.Ok.c, out.Ok.out]
+    ok = true
   } else {
-    result = JSON.stringify(output, (key, value) => {
+    result = [JSON.stringify(output, (key, value) => {
       if (key === "span") return undefined
       if (typeof value === "bigint")
         return Number(value)
       return value
-    }, 2)
+    }, 2)]
   }
 
   return (
     <main className="h-screen flex flex-row bg-black">
-      <div className="h-screen w-1/2 p-3 pr-1.5">
+      <div className="h-screen w-1/2 p-3 pr-1">
         <ReactCodeMirror
           value={code}
           ref={refs}
@@ -230,17 +233,52 @@ export default function Home() {
           extensions={[rust(), errorHover]}
         />
       </div>
-      <div className="h-screen w-1/2 p-3 pl-1.5">
+      <div className={`h-screen w-1/2 p-3 pl-1 ${ok ? "hidden" : ""}`}>
         <ReactCodeMirror
-          value={result}
+          value={result[0]}
           editable={false}
           className="h-full w-full"
           height="100%"
           width="100%"
           theme="dark"
-          extensions={[StreamLanguage.define(haskell)]}
+          extensions={[json()]}
         />
       </div>
+      <div className={`flex flex-col h-screen w-1/2 ${!ok ? "hidden" : ""}`}>
+        <div className="p-3 pl-1 pb-1 h-[60%]">
+          <ReactCodeMirror
+            value={result[0]}
+            editable={false}
+            className="h-full w-full"
+            height="100%"
+            width="100%"
+            theme="dark"
+            extensions={[StreamLanguage.define(haskell)]}
+          />
+        </div>
+        <div className="p-3 pl-1 pt-1 pb-1 h-[20%]">
+          <ReactCodeMirror
+            value={result[1] + "\n"}
+            editable={false}
+            className="h-full w-full"
+            height="100%"
+            width="100%"
+            theme="dark"
+            extensions={[cpp(), EditorView.lineWrapping]}
+          />
+        </div>
+        <div className="p-3 pl-1 pt-1 h-[20%]">
+          <ReactCodeMirror
+            value={result[2] + "\n"}
+            editable={false}
+            className="h-full w-full"
+            height="100%"
+            width="100%"
+            theme="dark"
+            extensions={[]}
+          />
+        </div>
+      </div>
     </main>
-  );
+  )
 }
