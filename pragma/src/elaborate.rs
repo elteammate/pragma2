@@ -2,14 +2,14 @@ use std::fmt::{Display, Formatter};
 use std::rc::Rc;
 use indexmap::IndexMap;
 use serde::Serialize;
-use crate::ast::{Ast, Expr, Item, Module, NodeExt, Param};
+use crate::ast::{Ast, BinaryOp, Expr, Item, Module, NodeExt, Param};
 use crate::cmrg;
 use crate::compound_result::{CompoundResult, err};
-use crate::intrinsics::make_intrinsics;
+use crate::intrinsics::{Intrinsic, make_intrinsics};
 use crate::smol_str2::SmolStr2;
 use crate::span::Span;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Term {
     Var(SmolStr2),
     Meta(usize),
@@ -23,7 +23,8 @@ pub enum Term {
     StringTy,
     BoolTy,
     UnitTy,
-    Fn { args: Vec<(SmolStr2, Rc<Term>)>, body: Rc<Code> },
+    Intrinsic(Box<dyn Intrinsic>),
+    Fn { args: Vec<(SmolStr2, Rc<Term>)>, body: Rc<Term> },
     FnTy { args: Vec<(Rc<Term>)>, ret_ty: Rc<Term> },
     Call { obj: Rc<Term>, args: Vec<Rc<Term>> },
     Pi { ty: Rc<Term>, ident: SmolStr2, body: Rc<Term> },
@@ -31,16 +32,9 @@ pub enum Term {
     App { obj: Rc<Term>, arg: Rc<Term> },
     Match { obj: Rc<Term>, cases: Vec<(Rc<Term>, Rc<Term>)>, default: Rc<Term> },
     Source { span: Span, term: Rc<Term> },
-}
-
-#[derive(Debug, Clone)]
-pub enum Code {
-    Var(SmolStr2),
-    Value(Rc<Term>),
-    Call { obj: Rc<Code>, args: Vec<Rc<Code>> },
-    Decl { name: SmolStr2, ty: Rc<Term>, val: Rc<Code> },
-    Block { stmts: Vec<Rc<Code>>, ret: Rc<Code> },
-    Typed { code: Rc<Code>, ty: Rc<Term> },
+    Decl { name: SmolStr2, ty: Rc<Term>, val: Rc<Term> },
+    Block { stmts: Vec<Rc<Term>>, ret: Rc<Term> },
+    Typed { term: Rc<Term>, ty: Rc<Term> },
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +207,7 @@ fn type_of(ctx: &mut Ctx, term: Rc<Term>) -> Rc<Term> {
         Term::UnitTy => ctx.star.clone(),
         Term::Call { obj, .. } => {
             let obj_ty = type_of(ctx, obj.clone());
+            let obj_ty = nf(ctx, obj_ty).expect("Typed code failed to normalize");
             match &*obj_ty {
                 Term::FnTy { ret_ty, .. } => ret_ty.clone(),
                 _ => panic!("Calling not-function in typed code"),
@@ -245,30 +240,17 @@ fn type_of(ctx: &mut Ctx, term: Rc<Term>) -> Rc<Term> {
         }
         Term::Fn { args, body } => {
             let ret_ty = ctx.with_local_decls(args, |ctx| {
-                type_of_code(ctx, body.clone())
+                type_of(ctx, body.clone())
             });
             Rc::new(Term::FnTy { args: args.iter().map(|(_, ty)| ty).cloned().collect(), ret_ty })
         }
         Term::Source { term, .. } => type_of(ctx, term.clone()),
-    }
-}
-
-fn type_of_code(ctx: &mut Ctx, code: Rc<Code>) -> Rc<Term> {
-    match &*code {
-        Code::Var(ident) => ctx.lookup(ident.clone()).expect("Ident not found").1.clone(),
-        Code::Value(term) => type_of(ctx, term.clone()),
-        Code::Call { obj, .. } => {
-            let obj_ty = type_of_code(ctx, obj.clone());
-            match &*obj_ty {
-                Term::FnTy { ret_ty, .. } => ret_ty.clone(),
-                _ => panic!("Calling not-function in typed code"),
-            }
+        Term::Block { ret, .. } => {
+            type_of(ctx, ret.clone())
         }
-        Code::Block { ret, .. } => {
-            type_of_code(ctx, ret.clone())
-        }
-        Code::Decl { .. } => ctx.unit_ty.clone(),
-        Code::Typed { ty, .. } => ty.clone(),
+        Term::Decl { .. } => ctx.unit_ty.clone(),
+        Term::Typed { ty, .. } => ty.clone(),
+        Term::Intrinsic(intrinsic) => intrinsic.type_of(),
     }
 }
 
@@ -461,8 +443,8 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
                 }).collect::<Result<Vec<_>>>()?;
 
                 let (body, inferred_ret) = ctx.with_local_decls(&args, |ctx| {
-                    infer_code(ctx, body)
-                });
+                    infer(ctx, body)
+                })?;
 
                 if let Some((_, ret_ty)) = ret_ty {
                     let ret_ty = check(ctx, ret_ty, &mut ctx.star.clone())?;
@@ -520,22 +502,44 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
                 ));
             }
 
+            Expr::Binary { op, lhs, rhs } => {
+                let (lhs, lhs_ty) = infer(ctx, lhs)?;
+                let (rhs, rhs_ty) = infer(ctx, rhs)?;
+
+                let item = SmolStr2::from(match op.node {
+                    BinaryOp::Add => "add",
+                    BinaryOp::Sub => "sub",
+                    BinaryOp::Mul => "mul",
+                });
+
+                if ctx.lookup(item.clone()).is_none() {
+                    return err(ElaborateError::Commented(
+                        op.span,
+                        format!("Binary operator `{}` not found", &item[..]),
+                    ));
+                }
+
+                let term = Rc::new(Term::Call {
+                    obj: Rc::new(Term::App {
+                        obj: Rc::new(Term::App {
+                            obj: Rc::new(Term::Var(item.clone())),
+                            arg: lhs_ty.clone(),
+                        }),
+                        arg: rhs_ty.clone(),
+                    }),
+                    args: vec![lhs, rhs],
+                });
+
+                let ty = type_of(ctx, term.clone());
+                return Ok((term, ty));
+            }
+
             _ => todo!("Can't infer type of expression yet {:#?}", expr.node),
         };
 
         Ok((Rc::new(val), Rc::new(ty)))
     })
 }
-
-fn infer_code(ctx: &mut Ctx, expr: &Ast<Expr>) -> (Rc<Code>, Rc<Term>) {
-    match &expr.node {
-        _ => {
-            let (value, inferred) = infer(ctx, expr).unwrap();
-            (Rc::new(Code::Value(value)), inferred)
-        }
-    }
-}
-
 
 /// Check that `expr` has type `ty` and return the inferred value,
 /// possibly strengthening the type in the process.
@@ -715,13 +719,13 @@ fn unify(ctx: &mut Ctx, a: Rc<Term>, b: Rc<Term>) -> Result<Rc<Term>> {
                     format!("Cannot unify functions with different number of arguments: `{}` and `{}`", a, b),
                 ));
             }
-            
+
             let args = args1.iter().zip(args2).map(|(arg1, arg2)| {
                 unify(ctx, arg1.clone(), arg2.clone())
             }).collect::<Result<Vec<_>>>()?;
-            
+
             let ret = unify(ctx, ret1.clone(), ret2.clone())?;
-            
+
             FnTy { args, ret_ty: ret }
         }
 
@@ -892,6 +896,10 @@ fn is_concrete(term: &Rc<Term>) -> bool {
         Term::Lam { body, ty, .. } => is_concrete(body) && is_concrete(ty),
         Term::App { obj, arg } => is_concrete(obj) && is_concrete(arg),
         Term::Match { .. } => false,
+        Term::Decl { ty, val, .. } => is_concrete(ty) && is_concrete(val),
+        Term::Block { stmts, ret } => stmts.iter().all(is_concrete) && is_concrete(ret),
+        Term::Typed { ty, term } => is_concrete(ty) && is_concrete(term),
+        Term::Intrinsic(_) => true,
     }
 }
 
@@ -910,7 +918,7 @@ fn contains_metas(term: &Rc<Term>) -> bool {
         Term::BoolTy => false,
         Term::UnitTy => false,
         Term::Fn { body, args } =>
-            code_contains_metas(body) ||
+            contains_metas(body) ||
                 args.iter().any(|(_, ty)| contains_metas(ty)),
         Term::FnTy { args, ret_ty } =>
             args.iter().any(contains_metas) ||
@@ -926,17 +934,10 @@ fn contains_metas(term: &Rc<Term>) -> bool {
                 cases.iter().any(|(pat, body)| contains_metas(pat) || contains_metas(body)) ||
                 contains_metas(default),
         Term::Source { term, .. } => contains_metas(term),
-    }
-}
-
-fn code_contains_metas(code: &Rc<Code>) -> bool {
-    match &**code {
-        Code::Var(_) => false,
-        Code::Value(term) => contains_metas(term),
-        Code::Call { obj, args } => code_contains_metas(obj) || args.iter().any(|arg| code_contains_metas(arg)),
-        Code::Block { ret, stmts } => code_contains_metas(ret) || stmts.iter().any(code_contains_metas),
-        Code::Decl { ty, val, .. } => contains_metas(ty) || code_contains_metas(val),
-        Code::Typed { code, .. } => code_contains_metas(code),
+        Term::Decl { ty, val, .. } => contains_metas(ty) || contains_metas(val),
+        Term::Block { stmts, ret } => stmts.iter().any(contains_metas) || contains_metas(ret),
+        Term::Typed { ty, term } => contains_metas(ty) || contains_metas(term),
+        Term::Intrinsic(_) => false,
     }
 }
 
@@ -1066,8 +1067,26 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
                             (ident.clone(), (val.clone(), ty.clone()))
                         }).collect::<Vec<_>>();
                     ctx.with_locals(&locals, |ctx| {
-                        eval_code(ctx, body.clone())
+                        nf(ctx, body.clone())
                     })
+                }
+                Term::Intrinsic(intrinsic) => {
+                    intrinsic.call(args)
+                }
+                Term::Match { obj, cases, default } => {
+                    let cases = cases.iter().map(|(pat, body)| {
+                        ctx.with_case(obj.clone(), pat.clone(), |ctx| {
+                            Ok((pat.clone(), nf(ctx, Rc::new(Term::Call {
+                                obj: body.clone(),
+                                args: args.clone(),
+                            })).unwrap_or(ctx.undef.clone())))
+                        })
+                    }).collect::<Result<Vec<_>>>()?;
+                    let default = nf(ctx, Rc::new(Term::Call {
+                        obj: default.clone(),
+                        args: args.clone(),
+                    })).unwrap_or(ctx.undef.clone());
+                    Ok(Rc::new(Term::Match { obj: obj.clone(), cases, default }))
                 }
                 _ => Ok(term),
             }
@@ -1225,25 +1244,19 @@ impl Display for Term {
                 write!(f, "{1:0$}}}", indent, "")
             }
             Term::Source { term, .. } => write!(f, "{}", term),
-        }
-    }
-}
-
-fn eval_code(ctx: &mut Ctx, code: Rc<Code>) -> Result<Rc<Term>> {
-    match &*code {
-        Code::Value(val) => nf(ctx, val.clone()),
-
-        Code::Var(ident) => {
-            if let Some((value, _)) = ctx.lookup(ident.clone()) {
-                nf(ctx, value)
-            } else {
-                err(ElaborateError::Commented(
-                    ctx.span,
-                    format!("Variable `{}` not found upon evaluation", &ident[..]),
-                ))
+            Term::Decl { name, val, ty } => write!(f, "{}: {} = {}", &name[..], ty, val),
+            Term::Block { stmts, ret } => {
+                writeln!(f, "{1:0$}{{", indent, "")?;
+                INDENT.with(|i| *i.borrow_mut() += 4);
+                for stmt in stmts {
+                    writeln!(f, "{1:0$}{};", indent, stmt)?;
+                }
+                writeln!(f, "{1:0$}{}", indent, ret)?;
+                INDENT.with(|i| *i.borrow_mut() -= 4);
+                write!(f, "{1:0$}}}", indent, "")
             }
+            Term::Typed { term, ty } => write!(f, "({})::{}", term, ty),
+            Term::Intrinsic(intrinsic) => write!(f, "<{}>", &intrinsic.name()[..]),
         }
-
-        _ => todo!("cannot evaluate code yet {:#?}", code),
     }
 }
