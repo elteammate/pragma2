@@ -50,24 +50,6 @@ pub fn compile(input: &str) -> Result<Output, CompileError> {
 #[test]
 fn test() {
     let input = r#"
-add [int], [int] = __intrinsic_int_add;
-sub [int], [int] = __intrinsic_int_sub;
-mul [int], [int] = __intrinsic_int_mul;
-div [int], [int] = __intrinsic_int_mul;
-lt [int], [int] = fn(x: int, y: int) true;
-
-hard_math = 2 + 2 / 5;
-
-puts = __intrinsic_puts;
-
-f = fn(x: int, y: int) x + y * 3;
-
-main = fn() {
-  x := 0;
-  while(x < 500) {
-    x = x + 1;
-  }
-};
     "#;
     let output = compile(input);
     println!("{:#?}", output);

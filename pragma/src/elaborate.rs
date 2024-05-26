@@ -39,6 +39,9 @@ pub enum Term {
     If { cond: Rc<Term>, then: Rc<Term>, else_: Rc<Term> },
     Assign { lhs: SmolStr2, rhs: Rc<Term> },
     While { cond: Rc<Term>, body: Rc<Term> },
+    // StructDecl { fields: Vec<(SmolStr2, Rc<Term>)> },
+    // StructInit { struct_: Rc<Term>, fields: Vec<(SmolStr2, Rc<Term>)> },
+    // Field { obj: Rc<Term>, field: SmolStr2 },
 }
 
 #[derive(Debug, Serialize)]
@@ -125,14 +128,14 @@ impl Ctx {
     }
 
     fn with_local_decl<T>(&mut self, ident: SmolStr2, ty: Rc<Term>, f: impl FnOnce(&mut Self) -> T) -> T {
-        self.with_local(ident.clone(), local(ident), ty.clone(), |ctx| {
+        self.with_local(ident.clone(), var(ident), ty.clone(), |ctx| {
             f(ctx)
         })
     }
 
     fn with_local_decls<T>(&mut self, decls: &[(SmolStr2, Rc<Term>)], f: impl FnOnce(&mut Self) -> T) -> T {
         for (ident, ty) in decls {
-            self.locals.push((ident.clone(), (local(ident.clone()), ty.clone())));
+            self.locals.push((ident.clone(), (var(ident.clone()), ty.clone())));
         }
         let result = f(self);
         for _ in decls {
@@ -170,7 +173,7 @@ impl Ctx {
         assert!(!self.block_boundaries.is_empty());
         match &**term {
             Term::Decl { name, ty, val } => {
-                self.locals.push((name.clone(), (local(name.clone()), ty.clone())));
+                self.locals.push((name.clone(), (var(name.clone()), ty.clone())));
                 self.consider(val);
             }
             Term::Call { obj, args } => {
@@ -217,7 +220,7 @@ impl Ctx {
     }
 }
 
-fn local(name: SmolStr2) -> Rc<Term> {
+fn var(name: SmolStr2) -> Rc<Term> {
     Rc::new(Term::Var(name))
 }
 
@@ -256,7 +259,7 @@ fn type_of(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
         }
         Term::Pi { .. } => ctx.star.clone(), // TODO: maybe filter out indicators properly
         Term::Lam { ident, ty, body } => {
-            ctx.with_local(ident.clone(), local(ident.clone()), ty.clone(), |ctx| {
+            ctx.with_local(ident.clone(), var(ident.clone()), ty.clone(), |ctx| {
                 let body = type_of(ctx, body.clone())?;
                 Result::Ok(Rc::new(Term::Pi { ident: ident.clone(), ty: ty.clone(), body }))
             })?
@@ -300,6 +303,31 @@ fn type_of(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
         Term::If { then, .. } => return type_of(ctx, then.clone()),
         Term::Assign { .. } => ctx.unit_ty.clone(),
         Term::While { .. } => ctx.unit_ty.clone(),
+        /*
+        Term::StructDecl { .. } => ctx.star.clone(),
+        Term::StructInit { .. } => term,
+        Term::Field { obj, field } => {
+            let obj_ty = type_of(ctx, obj.clone())?;
+            let obj_ty = nf(ctx, obj_ty).expect("Typed code failed to normalize");
+            return match &*obj_ty {
+                Term::StructDecl { fields } => {
+                    for (name, ty) in fields {
+                        if name == field {
+                            return Ok(ty.clone());
+                        }
+                    }
+                    err(ElaborateError::Commented(
+                        ctx.span,
+                        format!("Field `{}` not found in struct", field),
+                    ))
+                }
+                _ => err(ElaborateError::Commented(
+                    ctx.span,
+                    format!("Expected a struct, got `{}`", obj_ty),
+                )),
+            }
+        }
+         */
     })
 }
 
@@ -358,7 +386,7 @@ fn elaborate_item(ctx: &mut Ctx, item: &Item) -> Result<()> {
             Some(Param::Generic { ident, ty, .. }) => {
                 let ty = check(ctx, ty, &mut ctx.star.clone())?;
                 let (body, out_ty) = if let Some(ident) = ident {
-                    ctx.with_local(ident.node.clone(), local(ident.node.clone()), ty.clone(), |ctx| {
+                    ctx.with_local(ident.node.clone(), var(ident.node.clone()), ty.clone(), |ctx| {
                         elaborate_item_impl(ctx, item, depth + 1)
                     })?
                 } else {
@@ -691,12 +719,12 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
                     ty,
                 ))
             }
-            
+
             Expr::Assign { lvalue, value, .. } => {
                 let (lvalue, mut ty) = infer(ctx, lvalue)?;
                 let value = check(ctx, value, &mut ty)
                     .with_comment("Can't assign because of type mismatch")?;
-                
+
                 return Ok((
                     Rc::new(Term::Assign {
                         lhs: match &*lvalue {
@@ -711,7 +739,7 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
                     ctx.unit_ty.clone(),
                 ))
             }
-            
+
             Expr::While { cond, body, .. } => {
                 let cond = check(ctx, &cond, &mut Rc::new(Term::BoolTy))?;
                 let (body, _) = infer(ctx, body)?;
@@ -723,7 +751,76 @@ fn infer(ctx: &mut Ctx, expr: &Ast<Expr>) -> Result<(Rc<Term>, Rc<Term>)> {
                     ctx.unit_ty.clone(),
                 ))
             }
-            
+
+            Expr::Method { method, obj, args, .. } => {
+                let (obj, obj_ty) = infer(ctx, obj)?;
+                let mut args = args.iter().map(|arg| {
+                    let (arg, _) = infer(ctx, &arg.0)?;
+                    Ok(arg)
+                }).collect::<Result<Vec<_>>>()?;
+                args.insert(0, obj);
+
+                let desugared = Rc::new(Term::Call {
+                    obj: Rc::new(Term::App {
+                        obj: var(method.node.clone()),
+                        arg: obj_ty.clone(),
+                    }),
+                    args
+                });
+
+                let ty = type_of(ctx, desugared.clone())?;
+                return Ok((desugared, ty));
+            }
+
+            /*
+            Expr::StructDecl { fields, .. } => {
+                let fields = fields.iter().map(|(ident, _, value, _)| {
+                    let value = check(ctx, value, &mut ctx.star.clone())?;
+                    Ok((ident.node.clone(), value))
+                }).collect::<Result<Vec<_>>>()?;
+
+                return Ok((
+                    Rc::new(Term::StructDecl { fields }),
+                    ctx.star.clone(),
+                ))
+            }
+
+            Expr::StructInit { struct_, fields, .. } => {
+                let struct_ = check(ctx, struct_, &mut ctx.star.clone())?;
+                let fields = fields.iter().map(|(ident, _, value, _)| {
+                    let (value, _) = infer(ctx, value)?;
+                    Ok((ident.node.clone(), value))
+                }).collect::<Result<Vec<_>>>()?;
+
+                return Ok((
+                    Rc::new(Term::StructInit { struct_: struct_.clone(), fields }),
+                    struct_,
+                ))
+            }
+
+            Expr::Field { obj, field, .. } => {
+                let (obj, ty) = infer(ctx, obj)?;
+                let ty = nf(ctx, ty)?;
+                let field = field.node.clone();
+                return match &*ty {
+                    Term::StructDecl { fields } => {
+                        for (name, ty) in fields {
+                            if name == &field {
+                                return Ok((Rc::new(Term::Field { obj, field }), ty.clone()));
+                            }
+                        }
+                        err(ElaborateError::Commented(
+                            ctx.span,
+                            format!("Field `{}` not found in struct", field),
+                        ))
+                    }
+                    _ => err(ElaborateError::Commented(
+                        ctx.span,
+                        format!("Expected a struct, got `{}`", ty),
+                    )),
+                }
+            }
+             */
 
             _ => todo!("Can't infer type of expression yet {:#?}", expr.node),
         };
@@ -799,8 +896,8 @@ fn unify(ctx: &mut Ctx, a: Rc<Term>, b: Rc<Term>) -> Result<Rc<Term>> {
             let ident = fresh_common(ctx, ident1.clone(), ident2.clone());
 
             let ty = unify(ctx, ty1.clone(), ty2.clone())?;
-            let body1 = substitute(ctx, body1.clone(), ident1.clone(), local(ident.clone()));
-            let body2 = substitute(ctx, body2.clone(), ident2.clone(), local(ident.clone()));
+            let body1 = substitute(ctx, body1.clone(), ident1.clone(), var(ident.clone()));
+            let body2 = substitute(ctx, body2.clone(), ident2.clone(), var(ident.clone()));
             let body = unify(ctx, body1, body2)?;
 
             Pi { ident, ty, body }
@@ -939,9 +1036,9 @@ fn merge_into(ctx: &mut Ctx, term: Rc<Term>, add: Rc<Term>) -> Result<Rc<Term>> 
         ) => {
             let ident = fresh_common(ctx, ident1.clone(), ident2.clone());
             let ty = merge_into(ctx, ty1.clone(), ty2.clone())?;
-            let body1 = substitute(ctx, body1.clone(), ident1.clone(), local(ident.clone()));
-            let body2 = substitute(ctx, body2.clone(), ident2.clone(), local(ident.clone()));
-            ctx.with_local(ident.clone(), local(ident.clone()), ty.clone(), |ctx| {
+            let body1 = substitute(ctx, body1.clone(), ident1.clone(), var(ident.clone()));
+            let body2 = substitute(ctx, body2.clone(), ident2.clone(), var(ident.clone()));
+            ctx.with_local(ident.clone(), var(ident.clone()), ty.clone(), |ctx| {
                 let body = merge_into(ctx, body1, body2)?;
                 Ok(Rc::new(Term::Pi { ident, ty, body }))
             })
@@ -953,9 +1050,9 @@ fn merge_into(ctx: &mut Ctx, term: Rc<Term>, add: Rc<Term>) -> Result<Rc<Term>> 
         ) => {
             let ident = fresh_common(ctx, ident1.clone(), ident2.clone());
             let ty = merge_into(ctx, ty1.clone(), ty2.clone())?;
-            let body1 = substitute(ctx, body1.clone(), ident1.clone(), local(ident.clone()));
-            let body2 = substitute(ctx, body2.clone(), ident2.clone(), local(ident.clone()));
-            ctx.with_local(ident.clone(), local(ident.clone()), ty.clone(), |ctx| {
+            let body1 = substitute(ctx, body1.clone(), ident1.clone(), var(ident.clone()));
+            let body2 = substitute(ctx, body2.clone(), ident2.clone(), var(ident.clone()));
+            ctx.with_local(ident.clone(), var(ident.clone()), ty.clone(), |ctx| {
                 let body = merge_into(ctx, body1, body2)?;
                 Ok(Rc::new(Term::Lam { ident, ty, body }))
             })
@@ -1096,6 +1193,12 @@ fn is_concrete(term: &Rc<Term>) -> bool {
         Term::Intrinsic(_) => true,
         Term::Assign { rhs, .. } => is_concrete(rhs),
         Term::While { .. } => false,
+        /*
+        Term::StructDecl { fields } => fields.iter().all(|(_, ty)| is_concrete(ty)),
+        Term::StructInit { fields, struct_ } =>
+            is_concrete(struct_) && fields.iter().all(|(_, val)| is_concrete(val)),
+        Term::Field { obj, .. } => is_concrete(obj),
+         */
     }
 }
 
@@ -1137,6 +1240,11 @@ fn contains_metas(term: &Rc<Term>) -> bool {
         Term::Intrinsic(_) => false,
         Term::Assign { rhs, .. } => contains_metas(rhs),
         Term::While { cond, body } => contains_metas(cond) || contains_metas(body),
+        /*
+        Term::StructDecl { fields } => fields.iter().any(|(_, ty)| contains_metas(ty)),
+        Term::StructInit { fields, struct_ } => contains_metas(struct_) || fields.iter().any(|(_, val)| contains_metas(val)),
+        Term::Field { obj, .. } => contains_metas(obj),
+         */
     }
 }
 
@@ -1168,14 +1276,14 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
         }
         Term::Pi { ident, ty, body } => {
             let ty = nf(ctx, ty.clone())?;
-            ctx.with_local(ident.clone(), local(ident.clone()), ty.clone(), |ctx| {
+            ctx.with_local(ident.clone(), var(ident.clone()), ty.clone(), |ctx| {
                 let body = nf(ctx, body.clone())?;
                 Ok(Rc::new(Term::Pi { ident: ident.clone(), ty, body }))
             })
         }
         Term::Lam { ident, ty, body } => {
             let ty = nf(ctx, ty.clone())?;
-            ctx.with_local(ident.clone(), local(ident.clone()), ty.clone(), |ctx| {
+            ctx.with_local(ident.clone(), var(ident.clone()), ty.clone(), |ctx| {
                 let body = nf(ctx, body.clone())?;
                 Ok(Rc::new(Term::Lam { ident: ident.clone(), ty, body }))
             })
@@ -1360,6 +1468,66 @@ fn nf(ctx: &mut Ctx, term: Rc<Term>) -> Result<Rc<Term>> {
             let body = nf(ctx, body.clone())?;
             Ok(Rc::new(Term::While { cond, body }))
         }
+        /*
+        Term::StructDecl { fields, } => {
+            let fields = fields.iter().map(|(name, ty)| {
+                let ty = nf(ctx, ty.clone())?;
+                Ok((name.clone(), ty))
+            }).collect::<Result<Vec<_>>>()?;
+            Ok(Rc::new(Term::StructDecl { fields }))
+        }
+        Term::StructInit { struct_, fields } => {
+            let struct_ = nf(ctx, struct_.clone())?;
+            let fields = fields.iter().map(|(name, val)| {
+                let val = nf(ctx, val.clone())?;
+                Ok((name.clone(), val))
+            }).collect::<Result<Vec<_>>>()?;
+
+            match &*struct_ {
+                Term::StructDecl { fields: fields2 } => {
+                    if fields.iter().all(|(name, _)| fields2.iter().any(|(name2, _)| name == name2)) {
+                        if is_concrete(&term) {
+                            let mut fields2 = fields2.clone();
+                            for (name, val) in fields {
+                                for (name2, val2) in &mut fields2 {
+                                    if name == *name2 {
+                                        *val2 = val.clone();
+                                    }
+                                }
+                            }
+                        } else {
+                            Ok(Rc::new(Term::StructInit { struct_, fields }))
+                        } else {
+                            Ok(Rc::new(Term::StructInit { struct_, fields }))
+                        }
+                    } else {
+                        err(ElaborateError::Commented(
+                            ctx.span,
+                            format!("Struct `{}` does not have all the fields in the initializer", struct_),
+                        ))
+                    }
+                }
+
+                Term::Match { obj, cases, default } => {
+                    let cases = cases.iter().map(|(pat, body)| {
+                        ctx.with_case(obj.clone(), pat.clone(), |ctx| {
+                            Ok((pat.clone(), nf(ctx, Rc::new(Term::StructInit {
+                                struct_: body.clone(),
+                                fields: fields.clone(),
+                            })).unwrap_or(ctx.undef.clone())))
+                        })
+                    }).collect::<Result<Vec<_>>>()?;
+                    let default = nf(ctx, Rc::new(Term::StructInit {
+                        struct_: default.clone(),
+                        fields: fields.clone(),
+                    })).unwrap_or(ctx.undef.clone());
+                    Ok(Rc::new(Term::Match { obj: obj.clone(), cases, default }))
+                }
+
+                _ => Ok(Rc::new(Term::StructInit { struct_, fields }))
+            }
+        }
+         */
 
         Term::Undef => Ok(term),
         Term::Int(_) => Ok(term),
@@ -1646,6 +1814,26 @@ impl Display for Term {
             Term::Intrinsic(intrinsic) => write!(f, "<{}>", &intrinsic.name()[..]),
             Term::If { cond, then, else_ } => write!(f, "if {} then {} else {}", cond, then, else_),
             Term::While { cond, body } => write!(f, "while {} do {}", cond, body),
+            /*
+            Term::StructDecl { fields } => {
+                write!(f, "{{")?;
+                INDENT.with(|i| *i.borrow_mut() += 4);
+                for (name, ty) in fields {
+                    write!(f, "{1:0$}{2}: {3}, ", indent + 4, "", name, ty)?;
+                }
+                INDENT.with(|i| *i.borrow_mut() -= 4);
+                write!(f, "{1:0$}}}", indent, "")
+            }
+            Term::StructInit { struct_, fields } => {
+                write!(f, "{} {{", struct_)?;
+                INDENT.with(|i| *i.borrow_mut() += 4);
+                for (name, val) in fields {
+                    write!(f, "{1:0$}{2}: {3}, ", indent + 4, "", name, val)?;
+                }
+                INDENT.with(|i| *i.borrow_mut() -= 4);
+                write!(f, "{1:0$}}}", indent, "")
+            }
+             */
         }
     }
 }
@@ -1657,6 +1845,7 @@ struct Builder {
     externals: Vec<c::ExternalFunction>,
     added_externals: HashMap<SmolStr2, usize>,
     function_cache: Vec<(Rc<Term>, usize)>,
+    struct_cache: Vec<(Rc<Term>, usize)>,
 }
 
 struct FnBuilder {
@@ -1754,6 +1943,7 @@ pub fn extract_c(ctx: &mut Ctx) -> Result<c::Module> {
         functions: vec![],
         externals: vec![],
         function_cache: vec![],
+        struct_cache: vec![],
         added_externals: HashMap::new(),
     };
 
@@ -1857,8 +2047,8 @@ fn extract_fn(ctx: &mut Ctx, b: &mut Builder, term: Rc<Term>) -> Result<usize> {
     Ok(id)
 }
 
-fn extract_c_type(ctx: &mut Ctx, b: &mut Builder, term: &Term) -> Result<Option<c::CType>> {
-    Ok(match term {
+fn extract_c_type(ctx: &mut Ctx, b: &mut Builder, term: &Rc<Term>) -> Result<Option<c::CType>> {
+    Ok(match &**term {
         Term::Undef => return err(ElaborateError::Commented(
             ctx.span,
             "Cannot extract C type from undefined term".into(),
@@ -1873,12 +2063,58 @@ fn extract_c_type(ctx: &mut Ctx, b: &mut Builder, term: &Term) -> Result<Option<
         Term::Decl { .. } => None,
         Term::Block { ret, .. } => return extract_c_type(ctx, b, ret),
         Term::Typed { term, .. } => return extract_c_type(ctx, b, term),
+        /*
+        Term::StructDecl { .. } => {
+            let id = extract_c_struct(ctx, b, term.clone())?;
+            return if let Some(id) = id {
+                Ok(Some(c::CType::Struct(id)))
+            } else {
+                Ok(None)
+            }
+        }
+         */
         _ => return err(ElaborateError::Commented(
             ctx.span,
             format!("Cannot extract C type from term `{}`", term),
         )),
     })
 }
+
+/*
+fn extract_c_struct(ctx: &mut Ctx, b: &mut Builder, term: Rc<Term>) -> Result<Option<usize>> {
+    let id = b.struct_cache.iter().position(|(t, _)| **t == *term);
+    if let Some(id) = id {
+        return Ok(Some(id));
+    }
+
+    let Term::StructDecl { fields } = &*term else {
+        return err(ElaborateError::Commented(
+            ctx.span,
+            format!("Expected struct declaration, found `{}`", term),
+        ));
+    };
+
+    let fields = fields.iter()
+        .flat_map(|(_, ty)| {
+            extract_c_type(ctx, b, ty).transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if fields.is_empty() {
+        return Ok(None);
+    }
+
+    let id = b.structs.len();
+    b.struct_cache.push((term.clone(), id));
+
+
+    b.structs.push(c::Struct {
+        fields,
+    });
+
+    Ok(Some(id))
+}
+ */
 
 fn extract_c_expr(e: &mut Extraction, term: Rc<Term>) -> Result<Option<c::Expr>> {
     match &*term {
@@ -2069,7 +2305,7 @@ fn extract_c_expr(e: &mut Extraction, term: Rc<Term>) -> Result<Option<c::Expr>>
         Term::While { cond, body } => {
             let cond = extract_c_expr(e, cond.clone())?
                 .expect("ICE: While condition is not boolean");
-            
+
             let (res, body) = e.build_block(|e| {
                 let body = extract_c_expr(e, body.clone())?;
                 if let Some(body) = body {
@@ -2086,5 +2322,39 @@ fn extract_c_expr(e: &mut Extraction, term: Rc<Term>) -> Result<Option<c::Expr>>
 
             Ok(None)
         }
+
+        /*
+        Term::StructDecl { .. } => err(ElaborateError::Commented(
+            e.ctx.span,
+            "Cannot extract C expression from struct declaration".into(),
+        )),
+
+        Term::StructInit { struct_, fields } => {
+            let struct_ = extract_c_struct(e.ctx, e.b, struct_.clone())?;
+            if let Some(struct_) = struct_ {
+                let mut fields_ = vec![];
+                for (_, val) in fields.iter() {
+                    let expr = extract_c_expr(e, val.clone())?;
+                    if let Some(expr) = expr {
+                        // TODO: this is a hack, we need to do e.add_expr(...)
+                        fields_.push(expr);
+                    }
+                }
+
+                Ok(Some(c::Expr::StructBuild {
+                    id: struct_,
+                    fields: fields_,
+                }))
+            } else {
+                for (_, val) in fields {
+                    let expr = extract_c_expr(e, val.clone())?;
+                    if let Some(expr) = expr {
+                        e.add_statement(c::Statement::Expression(expr));
+                    }
+                }
+                Ok(None)
+            }
+        }
+         */
     }
 }
