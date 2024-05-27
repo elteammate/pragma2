@@ -402,6 +402,11 @@ fn emit_expression<'c>(
             write!(builder, "*")?;
             emit_expression(builder, names, rhs, Precedence::Multiply, true)?;
         }
+        Expr::Lt { lhs, rhs } => {
+            emit_expression(builder, names, lhs, Precedence::Compare, false)?;
+            write!(builder, "<")?;
+            emit_expression(builder, names, rhs, Precedence::Compare, true)?;
+        }
         Expr::UnaryPlus { x } => {
             // it's always a no-op, right?
             // write!(builder, "+")?;

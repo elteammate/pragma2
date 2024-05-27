@@ -50,6 +50,23 @@ pub fn compile(input: &str) -> Result<Output, CompileError> {
 #[test]
 fn test() {
     let input = r#"
+not [bool] = fn(x: bool) {
+  if (x) {
+    false
+  } else {
+    true
+  }
+};
+
+lt [int], [int] = fn(x: int, y: int) __intrinsic_int_lt;
+ge [int], [int] = fn(x: int, y: int) __intrinsic_int_lt;
+
+main = fn() {
+  x := 5;
+  while (x >= 0) {
+    x = x - 1;
+  }
+};
     "#;
     let output = compile(input);
     println!("{:#?}", output);

@@ -107,6 +107,7 @@ pub enum Expr {
     Cast { x: Box<Expr>, ty: CType },
     StructAccess { x: Box<Expr>, field: usize },
     StructBuild { id: usize, fields: Vec<Expr> },
+    Lt { lhs: Box<Expr>, rhs: Box<Expr> },
 }
 
 impl Expr {
@@ -129,6 +130,7 @@ impl Expr {
             Expr::Cast { .. } => Precedence::PrefixUnary,
             Expr::StructAccess { .. } => Precedence::SuffixUnary,
             Expr::StructBuild { .. } => Precedence::Lowest,
+            Expr::Lt { .. } => Precedence::Compare,
         }
     }
 }
